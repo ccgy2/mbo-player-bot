@@ -176,8 +176,8 @@ async def help_command(ctx):
     await ctx.reply(embed=embed)
 
 
-@bot.command(name="최근이동")
-async def recent_movements(ctx):
+@bot.command(name="최근이동", aliases=["최근"])
+async def recent_movements(ctx, *unused):
     if not await guard(ctx):
         return
     docs = db.collection("movements").order_by("date", direction=firestore.Query.DESCENDING).limit(5).stream()
@@ -199,6 +199,26 @@ async def recent_movements(ctx):
         embed.description = "등록된 이동 내역이 없습니다."
     await ctx.reply(embed=embed)
 
+
+
+@bot.command(name="이동")
+async def legacy_movement(ctx, movement_type: str = "", team: str = "", players_text: str = "", to_team: str = "", to_players_text: str = "", date_text: str = ""):
+    if not await guard(ctx):
+        return
+    movement_type = normalize(movement_type)
+    if movement_type == "트레이드":
+        await trade(ctx, team, players_text, to_team, to_players_text, date_text)
+        return
+    if movement_type == "방출":
+        await simple_movement(ctx, "RELEASE", team, players_text, to_team if is_date(to_team) else date_text)
+        return
+    if movement_type == "은퇴":
+        await simple_movement(ctx, "RETIRE", team, players_text, to_team if is_date(to_team) else date_text)
+        return
+    if movement_type == "임의해지":
+        await simple_movement(ctx, "FORCED_RELEASE", team, players_text, to_team if is_date(to_team) else date_text)
+        return
+    await ctx.reply("사용법: `!mbo 이동 <트레이드|방출|은퇴|임의해지> ...` 또는 `!mbo 도움말`")
 
 @bot.command(name="방출")
 async def release(ctx, team: str = "", players_text: str = "", date_text: str = ""):
@@ -342,14 +362,21 @@ async def validate_roster(ctx, *, lineup_text: str = ""):
 
 @bot.event
 async def on_command_error(ctx, error):
+    original = getattr(error, "original", error)
     if isinstance(error, commands.CommandNotFound):
         await ctx.reply("알 수 없는 명령어입니다. `!mbo 도움말`을 입력해보세요.")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply("명령어에 필요한 값이 부족합니다. `!mbo 도움말`을 확인해주세요.")
         return
     if isinstance(error, commands.BadArgument):
         await ctx.reply("명령어 형식이 올바르지 않습니다. `!mbo 도움말`을 확인해주세요.")
         return
-    print("명령어 처리 오류:", repr(error))
-    await ctx.reply(f"오류가 발생했습니다: {error}")
+    if isinstance(original, ValueError):
+        await ctx.reply(str(original))
+        return
+    print("명령어 처리 오류:", repr(original))
+    await ctx.reply(f"오류가 발생했습니다: {original}")
 
 
 @bot.event
@@ -358,3 +385,5 @@ async def on_ready():
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
+
+
