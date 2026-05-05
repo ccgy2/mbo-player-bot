@@ -356,17 +356,34 @@ async def send_announcement(embed):
         await channel.send(embed=embed)
 
 
-def movement_embed(kind, date, from_team, players, to_team=""):
+def movement_target_label(kind, to_team):
+    if kind == "RELEASE":
+        return "방출"
+    if kind == "RETIRE":
+        return "은퇴"
+    if kind == "FORCED_RELEASE":
+        return "임의탈퇴"
+    return to_team or "-"
+
+
+def movement_embed(kind, date, from_team, players, to_team="", to_players=None):
     label = MOVEMENT_LABELS.get(kind, kind)
-    embed = discord.Embed(title=f"{label} 공지", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="이동 유형", value=label, inline=True)
-    embed.add_field(name="날짜", value=date, inline=True)
-    embed.add_field(name="이전 팀", value=from_team, inline=True)
+    to_players = to_players or []
+    embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
 
-    if to_team and kind not in {"RELEASE", "RETIRE", "FORCED_RELEASE"}:
-        embed.add_field(name="새 팀", value=to_team, inline=True)
+    if kind == "TRADE" and to_players:
+        player_lines = players + to_players
+        from_lines = [from_team] * len(players) + [to_team] * len(to_players)
+        to_lines = [to_team] * len(players) + [from_team] * len(to_players)
+    else:
+        player_lines = players
+        from_lines = [from_team] * len(players)
+        to_lines = [movement_target_label(kind, to_team)] * len(players)
 
-    embed.add_field(name="선수", value=", ".join(players), inline=False)
+    embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
+    embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
+    embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
+    embed.set_footer(text="MBOMgr System (승인됨)")
     return embed
 
 
@@ -431,21 +448,37 @@ def parse_trade_args(args):
     return from_team, from_players, to_team, to_players, date
 
 
-def parse_simple_movement_args(args):
+def parse_players_team_args(args, usage):
     body, date = split_date_from_args(args)
     parts = body.split()
 
     if len(parts) < 2:
-        raise ValueError("사용법: `!mbo 이동 <방출|은퇴|임의해지> <팀> <선수명들> [날짜]`")
+        raise ValueError(usage)
 
-    team = parts[0].upper()
-    players_text = " ".join(parts[1:])
+    if parts[0].upper() in TEAM_META and parts[-1].upper() not in TEAM_META:
+        team = parts[0].upper()
+        players_text = " ".join(parts[1:])
+    else:
+        team = parts[-1].upper()
+        players_text = " ".join(parts[:-1])
+
+    if team not in TEAM_META or team == "무소속":
+        raise ValueError(f"팀 코드를 확인해주세요: {team}")
+
     players = parse_names(players_text)
 
     if not players:
         raise ValueError("선수를 찾지 못했습니다.")
 
     return team, players, date
+
+
+def parse_simple_movement_args(args):
+    return parse_players_team_args(args, "사용법: `!mbo 이동 <방출|은퇴|임의해지> <선수명들> <팀> [날짜]`")
+
+
+def parse_fa_sign_args(args):
+    return parse_players_team_args(args, "사용법: `!mbo 이동 영입 <선수명들> <팀> [날짜]`")
 
 
 def commit_simple_movement_sync(kind, team, players, date, author_text):
@@ -472,6 +505,44 @@ def commit_simple_movement_sync(kind, team, players, date, author_text):
 
         update_player(batch, player, payload)
         add_movement(batch, kind, name, from_team, "무소속", date, f"Discord 봇 입력: {author_text}", [name], [])
+
+    batch.commit()
+
+
+def find_fa_sign_player_sync(name):
+    docs = db.collection("players").where("name", "==", name).stream()
+    matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+
+    if not matches:
+        raise ValueError(f"선수 목록에 없는 선수입니다: {name}")
+
+    free_agents = [player for player in matches if normalize(player.get("team")) in {"", "무소속"}]
+    if free_agents:
+        return free_agents[0]
+
+    teams = ", ".join(normalize(player.get("team")) or "팀 미정" for player in matches)
+    raise ValueError(f"FA 영입은 무소속 선수만 가능합니다: {name} (현재 소속: {teams})")
+
+
+def commit_fa_sign_sync(players, to_team, date, author_text):
+    to_team = to_team.upper()
+    batch = db.batch()
+
+    for name in players:
+        player = find_fa_sign_player_sync(name)
+        from_team = normalize(player.get("team")) or "무소속"
+        validate_forced_return(player, to_team)
+
+        update_player(
+            batch,
+            player,
+            {
+                "team": to_team,
+                "forcedReleaseOriginalTeam": "",
+                "transfer": f"{date} FA 영입: {to_team}",
+            },
+        )
+        add_movement(batch, "FA_SIGN", name, from_team, to_team, date, f"Discord 봇 입력: {author_text}", [name], [])
 
     batch.commit()
 
@@ -723,19 +794,25 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="!mbo 이동 방출 <팀> <선수명들> [날짜]",
+        name="!mbo 이동 영입 <선수명들> <팀> [날짜]",
+        value="무소속 선수를 FA 영입합니다. 여러 명은 쉼표로 구분합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 이동 방출 <선수명들> <팀> [날짜]",
         value="선수를 무소속으로 이동합니다. 여러 명은 쉼표로 구분합니다.",
         inline=False,
     )
 
     embed.add_field(
-        name="!mbo 이동 은퇴 <팀> <선수명들> [날짜]",
+        name="!mbo 이동 은퇴 <선수명들> <팀> [날짜]",
         value="선수를 무소속으로 이동하고 은퇴 내역을 남깁니다.",
         inline=False,
     )
 
     embed.add_field(
-        name="!mbo 이동 임의해지 <팀> <선수명들> [날짜]",
+        name="!mbo 이동 임의해지 <선수명들> <팀> [날짜]",
         value="선수를 무소속으로 이동하고 원 소속팀 복귀 제한을 겁니다.",
         inline=False,
     )
@@ -761,6 +838,12 @@ async def help_command(ctx):
     embed.add_field(
         name="트레이드 예시",
         value="```!mbo 이동 트레이드 CPX papaya_yaru ODV KR_Windy, chan_seu1_12 2026-05-05```",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="영입/방출 예시",
+        value="```!mbo 이동 영입 PlayerName RMS\n!mbo 이동 방출 PlayerName RMS```",
         inline=False,
     )
 
@@ -827,8 +910,24 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
-        embed = movement_embed("TRADE", date, from_team, from_players, to_team)
-        embed.add_field(name="상대 선수", value=", ".join(to_players), inline=False)
+        embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
+
+        await ctx.reply(embed=embed)
+        await send_announcement(embed)
+        return
+
+    if movement_type in {"영입", "FA영입", "FA_SIGN", "FA"}:
+        to_team, players, date = parse_fa_sign_args(args)
+
+        await run_blocking(
+            commit_fa_sign_sync,
+            players,
+            to_team,
+            date,
+            str(ctx.author),
+        )
+
+        embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -888,7 +987,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
         await send_announcement(embed)
         return
 
-    await ctx.reply("사용법: `!mbo 이동 <트레이드|방출|은퇴|임의해지> ...` 또는 `!mbo 도움말`")
+    await ctx.reply("사용법: `!mbo 이동 <트레이드|영입|방출|은퇴|임의해지> ...` 또는 `!mbo 도움말`")
 
 
 @bot.command(name="트레이드")
@@ -908,8 +1007,28 @@ async def trade(ctx, *, args: str = ""):
         str(ctx.author),
     )
 
-    embed = movement_embed("TRADE", date, from_team, from_players, to_team)
-    embed.add_field(name="상대 선수", value=", ".join(to_players), inline=False)
+    embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
+
+    await ctx.reply(embed=embed)
+    await send_announcement(embed)
+
+
+@bot.command(name="영입", aliases=["FA영입", "FA"])
+async def fa_sign(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    to_team, players, date = parse_fa_sign_args(args)
+
+    await run_blocking(
+        commit_fa_sign_sync,
+        players,
+        to_team,
+        date,
+        str(ctx.author),
+    )
+
+    embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1009,22 +1128,30 @@ def movement_event_embed(data):
     label = MOVEMENT_LABELS.get(kind, kind)
     from_team = data.get("fromTeam", "-")
     to_team = data.get("toTeam", "-")
-    route = f"{from_team} -> {to_team}"
-    if kind == "RELEASE":
-        route = f"{from_team} -> 방출"
-    elif kind == "RETIRE":
-        route = f"{from_team} -> 은퇴"
-    elif kind == "FORCED_RELEASE":
-        route = f"{from_team} -> 임의해지"
-    elif kind == "NICKNAME":
-        route = f"{from_team} 닉네임 변경"
-    embed = discord.Embed(title=f"{label} 등록", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="경로", value=route, inline=False)
-    embed.add_field(name="선수", value=data.get("playerName") or ", ".join(data.get("fromPlayers", [])) or "-", inline=False)
-    embed.add_field(name="이동일", value=data.get("date", "-"), inline=True)
+    from_players = names_from_value(data.get("fromPlayers")) or names_from_value(data.get("playerName"))
+    to_players = names_from_value(data.get("toPlayers"))
+    embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
+
+    if kind == "TRADE" and to_players:
+        player_lines = from_players + to_players
+        from_lines = [from_team] * len(from_players) + [to_team] * len(to_players)
+        to_lines = [to_team] * len(from_players) + [from_team] * len(to_players)
+    elif kind == "NICKNAME" and to_players:
+        player_lines = from_players
+        from_lines = from_players
+        to_lines = to_players
+    else:
+        player_lines = from_players
+        from_lines = [from_team] * len(from_players)
+        to_lines = [movement_target_label(kind, to_team)] * len(from_players)
+
+    embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
+    embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
+    embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
     embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
     if data.get("note"):
         embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
+    embed.set_footer(text="MBOMgr System (승인됨)")
     return embed
 
 
