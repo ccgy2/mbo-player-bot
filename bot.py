@@ -20,6 +20,21 @@ CONFIG_REF = None
 SNAPSHOT_UNSUBSCRIBES = []
 SNAPSHOTS_STARTED = False
 
+DEFAULT_ROLE_IDS = {
+    "teams": {
+        "RMS": "1467379371059974442",
+        "NDG": "1467379373169705003",
+        "CPX": "1467379373504987136",
+        "IH": "1467379375954460901",
+        "KRA": "1467884269669056747",
+        "PLT": "1467885245016703039",
+        "ODV": "1467886778194333874",
+        "SLU": "1467907005229302094",
+    },
+    "retire": "1486690482250846350",
+    "forcedRelease": "1486690539012231178",
+}
+
 TEAM_META = {
     "ODV": {"name": "오버드라이브", "color": 0xFF6A00},
     "RMS": {"name": "레이 마린스", "color": 0xC9982C},
@@ -92,6 +107,28 @@ def parse_channel_id(value):
     return match.group(1)
 
 
+def parse_role_id(value):
+    text = normalize(value)
+    match = re.search(r"(\d{15,25})", text)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def merge_role_config(config):
+    saved = config.get("roleIds") or {}
+    saved_teams = saved.get("teams") or {}
+    return {
+        "teams": {**DEFAULT_ROLE_IDS["teams"], **saved_teams},
+        "retire": normalize(saved.get("retire")) or DEFAULT_ROLE_IDS["retire"],
+        "forcedRelease": normalize(saved.get("forcedRelease")) or DEFAULT_ROLE_IDS["forcedRelease"],
+    }
+
+
+async def configured_role_ids():
+    return merge_role_config(await get_bot_config())
+
+
 async def resolve_channel(channel_id):
     if not channel_id:
         return None
@@ -122,6 +159,124 @@ async def send_log(title, description="", fields=None, color=0x475569):
     await channel.send(embed=embed)
 
 
+async def find_member_by_player_name(guild, player_name):
+    target = normalize(player_name).lower()
+    if not target:
+        return None
+
+    def is_match(member):
+        values = [
+            getattr(member, "display_name", ""),
+            getattr(member, "name", ""),
+            getattr(member, "global_name", ""),
+        ]
+        return any(normalize(value).lower() == target for value in values)
+
+    member = next((item for item in guild.members if is_match(item)), None)
+    if member:
+        return member
+
+    try:
+        queried = await guild.query_members(query=player_name, limit=20)
+    except Exception as exc:
+        print("멤버 조회 실패:", repr(exc))
+        return None
+
+    return next((item for item in queried if is_match(item)), None)
+
+
+def get_role(guild, role_id):
+    if not role_id:
+        return None
+    return guild.get_role(int(role_id))
+
+
+def movement_role_targets(data):
+    kind = data.get("type")
+    from_team = normalize(data.get("fromTeam")).upper()
+    to_team = normalize(data.get("toTeam")).upper()
+    from_players = names_from_value(data.get("fromPlayers")) or names_from_value(data.get("playerName"))
+    to_players = names_from_value(data.get("toPlayers"))
+
+    if kind == "TRADE":
+        return [(name, to_team) for name in from_players] + [(name, from_team) for name in to_players]
+
+    if kind in {"FA_SIGN", "TRANSFER"}:
+        return [(name, to_team) for name in from_players]
+
+    if kind == "RELEASE":
+        return [(name, "")]
+
+    if kind == "RETIRE":
+        return [(name, "RETIRE")]
+
+    if kind == "FORCED_RELEASE":
+        return [(name, "FORCED_RELEASE")]
+
+    return []
+
+
+async def sync_member_roles_for_movement(data):
+    role_ids = await configured_role_ids()
+    team_role_ids = {team: normalize(role_id) for team, role_id in role_ids["teams"].items() if normalize(role_id)}
+    retire_role_id = normalize(role_ids.get("retire"))
+    forced_role_id = normalize(role_ids.get("forcedRelease"))
+    managed_role_ids = set(team_role_ids.values()) | {retire_role_id, forced_role_id}
+    managed_role_ids.discard("")
+    targets = movement_role_targets(data)
+
+    if not targets or not managed_role_ids:
+        return
+
+    results = []
+
+    for guild in bot.guilds:
+        guild_role_ids = {str(role.id) for role in guild.roles}
+        if not managed_role_ids.intersection(guild_role_ids):
+            continue
+
+        for player_name, target_key in targets:
+            member = await find_member_by_player_name(guild, player_name)
+            if not member:
+                results.append(f"{guild.name} / {player_name}: 멤버를 찾지 못함")
+                continue
+
+            remove_roles = [role for role in member.roles if str(role.id) in managed_role_ids]
+            add_role = None
+            target_label = target_key or "역할 제거"
+            if target_key == "RETIRE":
+                add_role = get_role(guild, retire_role_id)
+                target_label = "은퇴"
+            elif target_key == "FORCED_RELEASE":
+                add_role = get_role(guild, forced_role_id)
+                target_label = "임의탈퇴"
+            elif target_key:
+                add_role = get_role(guild, team_role_ids.get(target_key))
+
+            if target_key and not add_role:
+                results.append(f"{guild.name} / {player_name}: {target_label} 역할을 찾지 못함")
+                continue
+
+            try:
+                if remove_roles:
+                    await member.remove_roles(*remove_roles, reason="MBO 선수 이동 역할 동기화")
+                if add_role and add_role not in member.roles:
+                    await member.add_roles(add_role, reason="MBO 선수 이동 역할 동기화")
+                results.append(f"{guild.name} / {player_name}: {target_label}")
+            except discord.Forbidden:
+                results.append(f"{guild.name} / {player_name}: 권한 부족")
+            except Exception as exc:
+                results.append(f"{guild.name} / {player_name}: {exc}")
+
+    if results:
+        await send_log(
+            "Discord 역할 동기화",
+            "\n".join(results)[:4000],
+            [("이동 유형", MOVEMENT_LABELS.get(data.get("type"), data.get("type", "-")), True)],
+            0x475569,
+        )
+
+
 def normalize(value):
     return str(value or "").strip()
 
@@ -138,6 +293,12 @@ def parse_names(value):
     text = normalize(value)
     text = text.replace("，", ",")
     return [item.strip() for item in re.split(r"[\n\r,]+", text) if item.strip()]
+
+
+def names_from_value(value):
+    if isinstance(value, list):
+        return [normalize(item) for item in value if normalize(item)]
+    return parse_names(value)
 
 
 def team_color(team):
@@ -445,6 +606,72 @@ async def set_log_channel_command(ctx, action: str = "", channel_text: str = "")
         0x0F766E,
     )
 
+
+@bot.command(name="역할")
+async def set_role_command(ctx, category: str = "", team_or_role: str = "", role_text: str = ""):
+    if not await guard(ctx):
+        return
+
+    category = normalize(category)
+    role_ids = await configured_role_ids()
+
+    if category in {"목록", "리스트"}:
+        lines = [f"{team}: <@&{role_id}>" for team, role_id in sorted(role_ids["teams"].items())]
+        lines.append(f"은퇴: <@&{role_ids['retire']}>")
+        lines.append(f"임의탈퇴/임의해지: <@&{role_ids['forcedRelease']}>")
+        await ctx.reply("현재 역할 설정입니다.\n" + "\n".join(lines))
+        return
+
+    if category == "팀":
+        team = normalize(team_or_role).upper()
+        role_id = parse_role_id(role_text)
+        if team not in TEAM_META or team == "무소속":
+            await ctx.reply("팀 코드를 확인해주세요. 예: `!mbo 역할 팀 RMS @역할`")
+            return
+        if not role_id:
+            await ctx.reply("역할을 멘션해주세요. 예: `!mbo 역할 팀 RMS @역할`")
+            return
+        role_ids["teams"][team] = role_id
+        await set_bot_config({"roleIds": role_ids})
+        await ctx.reply(f"{team} 역할을 <@&{role_id}> 로 설정했습니다.")
+        await send_log("팀 역할 설정", f"{ctx.author} 님이 {team} 역할을 <@&{role_id}> 로 설정했습니다.", [], 0x0F766E)
+        return
+
+    if category.upper() in TEAM_META and category != "무소속":
+        team = category.upper()
+        role_id = parse_role_id(team_or_role)
+        if not role_id:
+            await ctx.reply("역할을 멘션해주세요. 예: `!mbo 역할 RMS @역할`")
+            return
+        role_ids["teams"][team] = role_id
+        await set_bot_config({"roleIds": role_ids})
+        await ctx.reply(f"{team} 역할을 <@&{role_id}> 로 설정했습니다.")
+        await send_log("팀 역할 설정", f"{ctx.author} 님이 {team} 역할을 <@&{role_id}> 로 설정했습니다.", [], 0x0F766E)
+        return
+
+    special_map = {
+        "은퇴": "retire",
+        "임의탈퇴": "forcedRelease",
+        "임의해지": "forcedRelease",
+    }
+    if category in special_map:
+        role_id = parse_role_id(team_or_role)
+        if not role_id:
+            await ctx.reply(f"역할을 멘션해주세요. 예: `!mbo 역할 {category} @역할`")
+            return
+        key = special_map[category]
+        role_ids[key] = role_id
+        await set_bot_config({"roleIds": role_ids})
+        await ctx.reply(f"{category} 역할을 <@&{role_id}> 로 설정했습니다.")
+        await send_log("상태 역할 설정", f"{ctx.author} 님이 {category} 역할을 <@&{role_id}> 로 설정했습니다.", [], 0x0F766E)
+        return
+
+    await ctx.reply(
+        "사용법: `!mbo 역할 팀 <팀코드> <@역할>`, `!mbo 역할 은퇴 <@역할>`, "
+        "`!mbo 역할 임의탈퇴 <@역할>`, `!mbo 역할 목록`"
+    )
+
+
 @bot.command(name="도움말")
 async def help_command(ctx):
     if not await guard(ctx):
@@ -463,6 +690,25 @@ async def help_command(ctx):
         value="누가 언제 웹 또는 Discord에서 작업했는지 기록할 로그 채널을 설정합니다.",
         inline=False,
     )
+
+    embed.add_field(
+        name="!mbo 역할 팀 <팀코드> <@역할>",
+        value="팀별 Discord 역할을 설정합니다. 예: `!mbo 역할 팀 RMS @RMS`",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 역할 은퇴 <@역할> / !mbo 역할 임의탈퇴 <@역할>",
+        value="은퇴, 임의탈퇴 상태 역할을 설정합니다. 현재 설정은 `!mbo 역할 목록`으로 확인합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="자동 역할 동기화",
+        value="트레이드/FA/이적은 기존 팀·상태 역할을 제거하고 새 팀 역할을 지급합니다. 방출은 관리 역할을 제거하고, 은퇴/임의탈퇴는 상태 역할을 지급합니다.",
+        inline=False,
+    )
+
 
     embed.add_field(
         name="!mbo 이동 트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
@@ -624,7 +870,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
         await send_announcement(embed)
         return
 
-    if movement_type == "임의해지":
+    if movement_type in {"임의해지", "임의탈퇴"}:
         team, players, date = parse_simple_movement_args(args)
 
         await run_blocking(
@@ -679,7 +925,7 @@ async def retire(ctx, *, args: str = ""):
     await simple_movement(ctx, "RETIRE", args)
 
 
-@bot.command(name="임의해지")
+@bot.command(name="임의해지", aliases=["임의탈퇴"])
 async def forced_release(ctx, *, args: str = ""):
     await simple_movement(ctx, "FORCED_RELEASE", args)
 
@@ -826,6 +1072,7 @@ def start_firestore_watchers():
             data = change.document.to_dict()
             embed = movement_event_embed(data)
             actor = data.get("createdByName", "웹/알 수 없음")
+            schedule_from_snapshot(sync_member_roles_for_movement(data))
             if data.get("createdBy") == "discord-python-bot":
                 schedule_from_snapshot(publish_firestore_event("Discord 선수 이동", embed, "Discord", actor, False))
             else:
