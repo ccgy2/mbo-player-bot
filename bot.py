@@ -226,7 +226,7 @@ async def sync_member_roles_for_movement(data):
     targets = movement_role_targets(data)
 
     if not targets or not managed_role_ids:
-        return
+        return []
 
     results = []
 
@@ -275,6 +275,23 @@ async def sync_member_roles_for_movement(data):
             [("이동 유형", MOVEMENT_LABELS.get(data.get("type"), data.get("type", "-")), True)],
             0x475569,
         )
+    return results
+
+
+async def sync_roles_for_discord_movement(kind, from_team, players, to_team, date, to_players=None):
+    await sync_member_roles_for_movement(
+        {
+            "type": kind,
+            "playerName": ", ".join(players),
+            "fromPlayers": players,
+            "toPlayers": to_players or [],
+            "fromTeam": from_team,
+            "toTeam": to_team,
+            "date": date,
+            "createdBy": "discord-python-bot",
+            "createdByName": "Discord Python Bot",
+        }
+    )
 
 
 def normalize(value):
@@ -743,6 +760,39 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
     )
 
 
+@bot.command(name="역할진단")
+async def role_diagnosis_command(ctx, *, player_name: str = ""):
+    if not await guard(ctx):
+        return
+
+    player_name = normalize(player_name)
+    if not player_name:
+        await ctx.reply("사용법: `!mbo 역할진단 <선수명>`")
+        return
+
+    role_ids = await configured_role_ids()
+    managed_role_ids = set(role_ids["teams"].values()) | {role_ids["retire"], role_ids["forcedRelease"]}
+    managed_role_ids.discard("")
+    lines = []
+
+    for guild in bot.guilds:
+        member = await find_member_by_player_name(guild, player_name)
+        if not member:
+            lines.append(f"{guild.name}: `{player_name}`와 정확히 일치하는 멤버를 찾지 못했습니다.")
+            continue
+
+        bot_member = guild.me or guild.get_member(bot.user.id)
+        highest = bot_member.top_role.name if bot_member else "확인 불가"
+        member_roles = [role.name for role in member.roles if str(role.id) in managed_role_ids]
+        lines.append(
+            f"{guild.name}: {member.mention}\n"
+            f"관리 역할: {', '.join(member_roles) if member_roles else '없음'}\n"
+            f"봇 최고 역할: {highest}"
+        )
+
+    await ctx.reply("\n\n".join(lines)[:1900] if lines else "봇이 들어가 있는 서버를 찾지 못했습니다.")
+
+
 @bot.command(name="도움말")
 async def help_command(ctx):
     if not await guard(ctx):
@@ -771,6 +821,12 @@ async def help_command(ctx):
     embed.add_field(
         name="!mbo 역할 은퇴 <@역할> / !mbo 역할 임의탈퇴 <@역할>",
         value="은퇴, 임의탈퇴 상태 역할을 설정합니다. 현재 설정은 `!mbo 역할 목록`으로 확인합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 역할진단 <선수명>",
+        value="선수명과 일치하는 Discord 멤버, 현재 관리 역할, 봇 역할 위치를 확인합니다.",
         inline=False,
     )
 
@@ -910,6 +966,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
+        await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
         embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
 
         await ctx.reply(embed=embed)
@@ -927,6 +984,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
+        await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
         embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
 
         await ctx.reply(embed=embed)
@@ -945,6 +1003,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
+        await sync_roles_for_discord_movement("RELEASE", team, players, "무소속", date)
         embed = movement_embed("RELEASE", date, team, players, "무소속")
 
         await ctx.reply(embed=embed)
@@ -963,6 +1022,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
+        await sync_roles_for_discord_movement("RETIRE", team, players, "무소속", date)
         embed = movement_embed("RETIRE", date, team, players, "무소속")
 
         await ctx.reply(embed=embed)
@@ -981,6 +1041,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
+        await sync_roles_for_discord_movement("FORCED_RELEASE", team, players, "무소속", date)
         embed = movement_embed("FORCED_RELEASE", date, team, players, "무소속")
 
         await ctx.reply(embed=embed)
@@ -1007,6 +1068,7 @@ async def trade(ctx, *, args: str = ""):
         str(ctx.author),
     )
 
+    await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
     embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
 
     await ctx.reply(embed=embed)
@@ -1028,6 +1090,7 @@ async def fa_sign(ctx, *, args: str = ""):
         str(ctx.author),
     )
 
+    await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
     embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
 
     await ctx.reply(embed=embed)
@@ -1064,6 +1127,7 @@ async def simple_movement(ctx, kind, args):
         str(ctx.author),
     )
 
+    await sync_roles_for_discord_movement(kind, team, players, "무소속", date)
     embed = movement_embed(kind, date, team, players, "무소속")
 
     await ctx.reply(embed=embed)
