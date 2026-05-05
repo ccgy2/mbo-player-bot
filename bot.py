@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from datetime import datetime, timezone
 
 import discord
@@ -72,7 +73,9 @@ def is_date(value):
 
 
 def parse_names(value):
-    return [item.strip() for item in re.split(r"[\n\r,，]+", normalize(value)) if item.strip()]
+    text = normalize(value)
+    text = text.replace("，", ",")
+    return [item.strip() for item in re.split(r"[\n\r,]+", text) if item.strip()]
 
 
 def team_color(team):
@@ -94,7 +97,11 @@ async def guard(ctx):
     return False
 
 
-def find_player(name, team=""):
+async def run_blocking(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def find_player_sync(name, team=""):
     docs = db.collection("players").where("name", "==", name).stream()
     matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
     if not team:
@@ -103,8 +110,12 @@ def find_player(name, team=""):
     return next((player for player in matches if normalize(player.get("team")).lower() == lowered_team), None)
 
 
-def get_required_player(name, team):
-    player = find_player(name, team)
+async def find_player(name, team=""):
+    return await run_blocking(find_player_sync, name, team)
+
+
+async def get_required_player(name, team):
+    player = await find_player(name, team)
     if not player:
         raise ValueError(f"선수 목록에 없는 선수입니다: {name} ({team})")
     return player
@@ -119,7 +130,9 @@ def validate_forced_return(player, target_team):
 async def send_announcement(embed):
     if not ANNOUNCE_CHANNEL_ID:
         return
+
     channel = bot.get_channel(int(ANNOUNCE_CHANNEL_ID)) or await bot.fetch_channel(int(ANNOUNCE_CHANNEL_ID))
+
     if channel:
         await channel.send(embed=embed)
 
@@ -130,8 +143,10 @@ def movement_embed(kind, date, from_team, players, to_team=""):
     embed.add_field(name="이동 유형", value=label, inline=True)
     embed.add_field(name="날짜", value=date, inline=True)
     embed.add_field(name="이전 팀", value=from_team, inline=True)
+
     if to_team and kind not in {"RELEASE", "RETIRE", "FORCED_RELEASE"}:
         embed.add_field(name="새 팀", value=to_team, inline=True)
+
     embed.add_field(name="선수", value=", ".join(players), inline=False)
     return embed
 
@@ -161,129 +176,122 @@ def update_player(batch, player, payload):
     batch.update(db.collection("players").document(player["id"]), {**payload, "updatedAt": firestore.SERVER_TIMESTAMP})
 
 
-@bot.command(name="도움말")
-async def help_command(ctx):
-    if not await guard(ctx):
-        return
-    embed = discord.Embed(title="MBO Python 봇 명령어", color=0x0F766E)
-    embed.add_field(name="!mbo 트레이드 <이전팀> <선수명> <새팀> <상대선수명> [날짜]", value="두 팀 선수의 로스터 팀을 서로 바꿉니다.", inline=False)
-    embed.add_field(name="!mbo 방출 <팀> <선수명> [날짜]", value="선수를 무소속으로 이동합니다.", inline=False)
-    embed.add_field(name="!mbo 은퇴 <팀> <선수명> [날짜]", value="선수를 무소속으로 이동하고 은퇴 내역을 남깁니다.", inline=False)
-    embed.add_field(name="!mbo 임의해지 <팀> <선수명> [날짜]", value="선수를 무소속으로 이동하고 원 소속팀 복귀 제한을 겁니다.", inline=False)
-    embed.add_field(name="!mbo 최근이동", value="최근 이동 내역 5건을 조회합니다.", inline=False)
-    embed.add_field(name="!mbo 유효성검사 <타순표>", value="타순표 닉네임이 로스터에 있는지 검사합니다. 여러 줄 입력 가능.", inline=False)
-    embed.add_field(name="타순표 예시", value="```!mbo 유효성검사\n1. Axrq__ CF\n2번 CUCCl 1B\n3. _w0nyu1 LF```", inline=False)
-    await ctx.reply(embed=embed)
+def split_date_from_args(args):
+    text = normalize(args)
+    parts = text.split()
+
+    if parts and is_date(parts[-1]):
+        date = parts[-1]
+        body = " ".join(parts[:-1]).strip()
+        return body, date
+
+    return text, today()
 
 
-@bot.command(name="최근이동", aliases=["최근"])
-async def recent_movements(ctx, *unused):
-    if not await guard(ctx):
-        return
-    docs = db.collection("movements").order_by("date", direction=firestore.Query.DESCENDING).limit(5).stream()
-    embed = discord.Embed(title="최근 이동 내역", color=0x0F766E, timestamp=datetime.now(timezone.utc))
-    count = 0
-    for doc in docs:
-        count += 1
-        data = doc.to_dict()
-        label = MOVEMENT_LABELS.get(data.get("type"), data.get("type", "이동"))
-        route = f"{data.get('fromTeam', '-') } -> {data.get('toTeam', '-')}"
-        if data.get("type") == "RELEASE":
-            route = f"{data.get('fromTeam', '-')} -> 방출"
-        elif data.get("type") == "RETIRE":
-            route = f"{data.get('fromTeam', '-')} -> 은퇴"
-        elif data.get("type") == "FORCED_RELEASE":
-            route = f"{data.get('fromTeam', '-')} -> 임의해지"
-        embed.add_field(name=f"{data.get('date', '-')} · {label}", value=f"{data.get('playerName', '-')}\n{route}", inline=False)
-    if not count:
-        embed.description = "등록된 이동 내역이 없습니다."
-    await ctx.reply(embed=embed)
+def parse_trade_args(args):
+    body, date = split_date_from_args(args)
+    parts = body.split()
+
+    if len(parts) < 4:
+        raise ValueError("사용법: `!mbo 이동 트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]`")
+
+    from_team = parts[0].upper()
+    from_players_text = parts[1]
+    to_team = parts[2].upper()
+    to_players_text = " ".join(parts[3:])
+
+    from_players = parse_names(from_players_text)
+    to_players = parse_names(to_players_text)
+
+    if not from_players:
+        raise ValueError("보내는 선수를 찾지 못했습니다.")
+
+    if not to_players:
+        raise ValueError("받는 선수를 찾지 못했습니다.")
+
+    return from_team, from_players, to_team, to_players, date
 
 
+def parse_simple_movement_args(args):
+    body, date = split_date_from_args(args)
+    parts = body.split()
 
-@bot.command(name="이동")
-async def legacy_movement(ctx, movement_type: str = "", team: str = "", players_text: str = "", to_team: str = "", to_players_text: str = "", date_text: str = ""):
-    if not await guard(ctx):
-        return
-    movement_type = normalize(movement_type)
-    if movement_type == "트레이드":
-        await trade(ctx, team, players_text, to_team, to_players_text, date_text)
-        return
-    if movement_type == "방출":
-        await simple_movement(ctx, "RELEASE", team, players_text, to_team if is_date(to_team) else date_text)
-        return
-    if movement_type == "은퇴":
-        await simple_movement(ctx, "RETIRE", team, players_text, to_team if is_date(to_team) else date_text)
-        return
-    if movement_type == "임의해지":
-        await simple_movement(ctx, "FORCED_RELEASE", team, players_text, to_team if is_date(to_team) else date_text)
-        return
-    await ctx.reply("사용법: `!mbo 이동 <트레이드|방출|은퇴|임의해지> ...` 또는 `!mbo 도움말`")
+    if len(parts) < 2:
+        raise ValueError("사용법: `!mbo 이동 <방출|은퇴|임의해지> <팀> <선수명들> [날짜]`")
 
-@bot.command(name="방출")
-async def release(ctx, team: str = "", players_text: str = "", date_text: str = ""):
-    await simple_movement(ctx, "RELEASE", team, players_text, date_text)
-
-
-@bot.command(name="은퇴")
-async def retire(ctx, team: str = "", players_text: str = "", date_text: str = ""):
-    await simple_movement(ctx, "RETIRE", team, players_text, date_text)
-
-
-@bot.command(name="임의해지")
-async def forced_release(ctx, team: str = "", players_text: str = "", date_text: str = ""):
-    await simple_movement(ctx, "FORCED_RELEASE", team, players_text, date_text)
-
-
-async def simple_movement(ctx, kind, team, players_text, date_text):
-    if not await guard(ctx):
-        return
-    if not team or not players_text:
-        await ctx.reply(f"사용법: `!mbo {MOVEMENT_LABELS[kind]} <팀> <선수명> [날짜]`")
-        return
-    date = date_text if is_date(date_text) else today()
-    from_team = team.upper()
+    team = parts[0].upper()
+    players_text = " ".join(parts[1:])
     players = parse_names(players_text)
+
+    if not players:
+        raise ValueError("선수를 찾지 못했습니다.")
+
+    return team, players, date
+
+
+def commit_simple_movement_sync(kind, team, players, date, author_text):
+    from_team = team.upper()
     batch = db.batch()
+
     for name in players:
-        player = get_required_player(name, from_team)
+        docs = db.collection("players").where("name", "==", name).stream()
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        player = next((p for p in matches if normalize(p.get("team")).lower() == from_team.lower()), None)
+
+        if not player:
+            raise ValueError(f"선수 목록에 없는 선수입니다: {name} ({from_team})")
+
         payload = {
             "team": "무소속",
             "transfer": f"{date} {from_team}에서 {MOVEMENT_LABELS[kind]}",
         }
+
         if kind == "FORCED_RELEASE":
             payload["forcedReleaseOriginalTeam"] = from_team
         else:
             payload["forcedReleaseOriginalTeam"] = ""
+
         update_player(batch, player, payload)
-        add_movement(batch, kind, name, from_team, "무소속", date, f"Discord Python 봇 입력: {ctx.author}", [name], [])
+        add_movement(batch, kind, name, from_team, "무소속", date, f"Discord Python 봇 입력: {author_text}", [name], [])
+
     batch.commit()
-    embed = movement_embed(kind, date, from_team, players, "무소속")
-    await ctx.reply(embed=embed)
-    await send_announcement(embed)
 
 
-@bot.command(name="트레이드")
-async def trade(ctx, from_team: str = "", from_players_text: str = "", to_team: str = "", to_players_text: str = "", date_text: str = ""):
-    if not await guard(ctx):
-        return
-    if not from_team or not from_players_text or not to_team or not to_players_text:
-        await ctx.reply("사용법: `!mbo 트레이드 <이전팀> <선수명> <새팀> <상대선수명> [날짜]`")
-        return
-    date = date_text if is_date(date_text) else today()
+def commit_trade_sync(from_team, from_players, to_team, to_players, date, author_text):
     from_team = from_team.upper()
     to_team = to_team.upper()
-    from_players = parse_names(from_players_text)
-    to_players = parse_names(to_players_text)
 
-    from_records = [get_required_player(name, from_team) for name in from_players]
-    to_records = [get_required_player(name, to_team) for name in to_players]
+    from_records = []
+    to_records = []
+
+    for name in from_players:
+        docs = db.collection("players").where("name", "==", name).stream()
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        player = next((p for p in matches if normalize(p.get("team")).lower() == from_team.lower()), None)
+
+        if not player:
+            raise ValueError(f"선수 목록에 없는 선수입니다: {name} ({from_team})")
+
+        from_records.append(player)
+
+    for name in to_players:
+        docs = db.collection("players").where("name", "==", name).stream()
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        player = next((p for p in matches if normalize(p.get("team")).lower() == to_team.lower()), None)
+
+        if not player:
+            raise ValueError(f"선수 목록에 없는 선수입니다: {name} ({to_team})")
+
+        to_records.append(player)
+
     for player in from_records:
         validate_forced_return(player, to_team)
+
     for player in to_records:
         validate_forced_return(player, from_team)
 
     batch = db.batch()
+
     for player in from_records:
         update_player(
             batch,
@@ -294,6 +302,7 @@ async def trade(ctx, from_team: str = "", from_players_text: str = "", to_team: 
                 "transfer": f"{date} {from_team}에서 {to_team}으로 트레이드",
             },
         )
+
     for player in to_records:
         update_player(
             batch,
@@ -304,6 +313,7 @@ async def trade(ctx, from_team: str = "", from_players_text: str = "", to_team: 
                 "transfer": f"{date} {to_team}에서 {from_team}으로 트레이드",
             },
         )
+
     add_movement(
         batch,
         "TRADE",
@@ -311,13 +321,263 @@ async def trade(ctx, from_team: str = "", from_players_text: str = "", to_team: 
         from_team,
         to_team,
         date,
-        f"Discord Python 봇 입력: {ctx.author}",
+        f"Discord Python 봇 입력: {author_text}",
         from_players,
         to_players,
     )
+
     batch.commit()
+
+
+def fetch_recent_movements_sync():
+    docs = db.collection("movements").order_by("date", direction=firestore.Query.DESCENDING).limit(5).stream()
+    return [doc.to_dict() for doc in docs]
+
+
+@bot.command(name="도움말")
+async def help_command(ctx):
+    if not await guard(ctx):
+        return
+
+    embed = discord.Embed(title="MBO Python 봇 명령어", color=0x0F766E)
+
+    embed.add_field(
+        name="!mbo 이동 트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
+        value="선수를 트레이드합니다. 받는 선수는 쉼표로 여러 명 입력할 수 있습니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
+        value="이동 트레이드와 동일합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 이동 방출 <팀> <선수명들> [날짜]",
+        value="선수를 무소속으로 이동합니다. 여러 명은 쉼표로 구분합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 이동 은퇴 <팀> <선수명들> [날짜]",
+        value="선수를 무소속으로 이동하고 은퇴 내역을 남깁니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 이동 임의해지 <팀> <선수명들> [날짜]",
+        value="선수를 무소속으로 이동하고 원 소속팀 복귀 제한을 겁니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 최근이동",
+        value="최근 이동 내역 5건을 조회합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 최근 이동",
+        value="최근 이동 내역 5건을 조회합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 유효성검사 <타순표>",
+        value="타순표 닉네임이 로스터에 있는지 검사합니다. 여러 줄 입력 가능.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="트레이드 예시",
+        value="```!mbo 이동 트레이드 CPX papaya_yaru ODV KR_Windy, chan_seu1_12 2026-05-05```",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="타순표 예시",
+        value="```!mbo 유효성검사\n1. Axrq__ CF\n2번 CUCCl 1B\n3. _w0nyu1 LF```",
+        inline=False,
+    )
+
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="최근이동", aliases=["최근"])
+async def recent_movements(ctx, *unused):
+    if not await guard(ctx):
+        return
+
+    records = await run_blocking(fetch_recent_movements_sync)
+
+    embed = discord.Embed(title="최근 이동 내역", color=0x0F766E, timestamp=datetime.now(timezone.utc))
+
+    if not records:
+        embed.description = "등록된 이동 내역이 없습니다."
+        await ctx.reply(embed=embed)
+        return
+
+    for data in records:
+        label = MOVEMENT_LABELS.get(data.get("type"), data.get("type", "이동"))
+        route = f"{data.get('fromTeam', '-')} -> {data.get('toTeam', '-')}"
+
+        if data.get("type") == "RELEASE":
+            route = f"{data.get('fromTeam', '-')} -> 방출"
+        elif data.get("type") == "RETIRE":
+            route = f"{data.get('fromTeam', '-')} -> 은퇴"
+        elif data.get("type") == "FORCED_RELEASE":
+            route = f"{data.get('fromTeam', '-')} -> 임의해지"
+
+        embed.add_field(
+            name=f"{data.get('date', '-')} · {label}",
+            value=f"{data.get('playerName', '-')}\n{route}",
+            inline=False,
+        )
+
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="이동")
+async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    movement_type = normalize(movement_type)
+
+    if movement_type == "트레이드":
+        from_team, from_players, to_team, to_players, date = parse_trade_args(args)
+
+        await run_blocking(
+            commit_trade_sync,
+            from_team,
+            from_players,
+            to_team,
+            to_players,
+            date,
+            str(ctx.author),
+        )
+
+        embed = movement_embed("TRADE", date, from_team, from_players, to_team)
+        embed.add_field(name="상대 선수", value=", ".join(to_players), inline=False)
+
+        await ctx.reply(embed=embed)
+        await send_announcement(embed)
+        return
+
+    if movement_type == "방출":
+        team, players, date = parse_simple_movement_args(args)
+
+        await run_blocking(
+            commit_simple_movement_sync,
+            "RELEASE",
+            team,
+            players,
+            date,
+            str(ctx.author),
+        )
+
+        embed = movement_embed("RELEASE", date, team, players, "무소속")
+
+        await ctx.reply(embed=embed)
+        await send_announcement(embed)
+        return
+
+    if movement_type == "은퇴":
+        team, players, date = parse_simple_movement_args(args)
+
+        await run_blocking(
+            commit_simple_movement_sync,
+            "RETIRE",
+            team,
+            players,
+            date,
+            str(ctx.author),
+        )
+
+        embed = movement_embed("RETIRE", date, team, players, "무소속")
+
+        await ctx.reply(embed=embed)
+        await send_announcement(embed)
+        return
+
+    if movement_type == "임의해지":
+        team, players, date = parse_simple_movement_args(args)
+
+        await run_blocking(
+            commit_simple_movement_sync,
+            "FORCED_RELEASE",
+            team,
+            players,
+            date,
+            str(ctx.author),
+        )
+
+        embed = movement_embed("FORCED_RELEASE", date, team, players, "무소속")
+
+        await ctx.reply(embed=embed)
+        await send_announcement(embed)
+        return
+
+    await ctx.reply("사용법: `!mbo 이동 <트레이드|방출|은퇴|임의해지> ...` 또는 `!mbo 도움말`")
+
+
+@bot.command(name="트레이드")
+async def trade(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    from_team, from_players, to_team, to_players, date = parse_trade_args(args)
+
+    await run_blocking(
+        commit_trade_sync,
+        from_team,
+        from_players,
+        to_team,
+        to_players,
+        date,
+        str(ctx.author),
+    )
+
     embed = movement_embed("TRADE", date, from_team, from_players, to_team)
     embed.add_field(name="상대 선수", value=", ".join(to_players), inline=False)
+
+    await ctx.reply(embed=embed)
+    await send_announcement(embed)
+
+
+@bot.command(name="방출")
+async def release(ctx, *, args: str = ""):
+    await simple_movement(ctx, "RELEASE", args)
+
+
+@bot.command(name="은퇴")
+async def retire(ctx, *, args: str = ""):
+    await simple_movement(ctx, "RETIRE", args)
+
+
+@bot.command(name="임의해지")
+async def forced_release(ctx, *, args: str = ""):
+    await simple_movement(ctx, "FORCED_RELEASE", args)
+
+
+async def simple_movement(ctx, kind, args):
+    if not await guard(ctx):
+        return
+
+    team, players, date = parse_simple_movement_args(args)
+
+    await run_blocking(
+        commit_simple_movement_sync,
+        kind,
+        team,
+        players,
+        date,
+        str(ctx.author),
+    )
+
+    embed = movement_embed(kind, date, team, players, "무소속")
+
     await ctx.reply(embed=embed)
     await send_announcement(embed)
 
@@ -325,13 +585,18 @@ async def trade(ctx, from_team: str = "", from_players_text: str = "", to_team: 
 def parse_lineup_line(line):
     cleaned = normalize(line)
     cleaned = re.sub(r"^\d+\s*(?:번|[.)])\s*", "", cleaned)
+
     if not cleaned:
         return None
+
     parts = cleaned.split()
+
     if not parts:
         return None
+
     name = parts[0]
     position = next((token for token in parts[1:] if "교체" not in token), "")
+
     return {"name": name, "position": position}
 
 
@@ -339,42 +604,55 @@ def parse_lineup_line(line):
 async def validate_roster(ctx, *, lineup_text: str = ""):
     if not await guard(ctx):
         return
+
     if not lineup_text:
         await ctx.reply("사용법: `!mbo 유효성검사 <타순표>`\n여러 줄 타순표도 그대로 붙여넣을 수 있습니다.")
         return
+
     entries = [entry for entry in (parse_lineup_line(line) for line in lineup_text.splitlines()) if entry]
+
     if not entries:
         await ctx.reply("검사할 선수를 찾지 못했습니다.")
         return
+
     found = []
     missing = []
+
     for entry in entries:
-        player = find_player(entry["name"])
+        player = await find_player(entry["name"])
+
         if player:
             found.append(f"{entry['name']} {entry['position']} · {player.get('team', '팀 미정')}")
         else:
             missing.append(f"{entry['name']} {entry['position']}".strip())
+
     embed = discord.Embed(title="로스터 유효성 검사", color=0x0F766E)
     embed.add_field(name=f"등록됨 ({len(found)})", value="\n".join(found)[:1024] if found else "-", inline=False)
     embed.add_field(name=f"미등록 ({len(missing)})", value="\n".join(missing)[:1024] if missing else "-", inline=False)
+
     await ctx.reply(embed=embed)
 
 
 @bot.event
 async def on_command_error(ctx, error):
     original = getattr(error, "original", error)
+
     if isinstance(error, commands.CommandNotFound):
         await ctx.reply("알 수 없는 명령어입니다. `!mbo 도움말`을 입력해보세요.")
         return
+
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.reply("명령어에 필요한 값이 부족합니다. `!mbo 도움말`을 확인해주세요.")
         return
+
     if isinstance(error, commands.BadArgument):
         await ctx.reply("명령어 형식이 올바르지 않습니다. `!mbo 도움말`을 확인해주세요.")
         return
+
     if isinstance(original, ValueError):
         await ctx.reply(str(original))
         return
+
     print("명령어 처리 오류:", repr(original))
     await ctx.reply(f"오류가 발생했습니다: {original}")
 
@@ -385,5 +663,3 @@ async def on_ready():
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
-
-
