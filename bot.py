@@ -294,6 +294,24 @@ async def sync_roles_for_discord_movement(kind, from_team, players, to_team, dat
     )
 
 
+async def sync_roles_for_player_registration(name, team):
+    if team == "무소속":
+        return []
+    return await sync_member_roles_for_movement(
+        {
+            "type": "FA_SIGN",
+            "playerName": name,
+            "fromPlayers": [name],
+            "toPlayers": [],
+            "fromTeam": "무소속",
+            "toTeam": team,
+            "date": today(),
+            "createdBy": "discord-python-bot",
+            "createdByName": "Discord Python Bot",
+        }
+    )
+
+
 def normalize(value):
     return str(value or "").strip()
 
@@ -383,7 +401,7 @@ def movement_target_label(kind, to_team):
     return to_team or "-"
 
 
-def movement_embed(kind, date, from_team, players, to_team="", to_players=None):
+def movement_embed(kind, date, from_team, players, to_team="", to_players=None, reason=""):
     label = MOVEMENT_LABELS.get(kind, kind)
     to_players = to_players or []
     embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
@@ -400,6 +418,8 @@ def movement_embed(kind, date, from_team, players, to_team="", to_players=None):
     embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
     embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
     embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
+    if normalize(reason):
+        embed.add_field(name="사유", value=normalize(reason)[:1024], inline=False)
     embed.set_footer(text="MBOMgr System (승인됨)")
     return embed
 
@@ -472,33 +492,87 @@ def parse_players_team_args(args, usage):
     if len(parts) < 2:
         raise ValueError(usage)
 
-    if parts[0].upper() in TEAM_META and parts[-1].upper() not in TEAM_META:
+    if parts[0].upper() in TEAM_META:
         team = parts[0].upper()
         players_text = " ".join(parts[1:])
     else:
-        team = parts[-1].upper()
-        players_text = " ".join(parts[:-1])
+        team_index = next((index for index, part in enumerate(parts[1:], start=1) if part.upper() in TEAM_META), -1)
+        if team_index < 0:
+            team = parts[-1].upper()
+            players_text = " ".join(parts[:-1])
+            reason = ""
+        else:
+            team = parts[team_index].upper()
+            players_text = " ".join(parts[:team_index])
+            reason = " ".join(parts[team_index + 1 :])
 
     if team not in TEAM_META or team == "무소속":
         raise ValueError(f"팀 코드를 확인해주세요: {team}")
+
+    if parts[0].upper() in TEAM_META:
+        reason = ""
 
     players = parse_names(players_text)
 
     if not players:
         raise ValueError("선수를 찾지 못했습니다.")
 
-    return team, players, date
+    return team, players, date, normalize(reason)
 
 
 def parse_simple_movement_args(args):
-    return parse_players_team_args(args, "사용법: `!mbo 이동 <방출|은퇴|임의해지> <선수명들> <팀> [날짜]`")
+    return parse_players_team_args(args, "사용법: `!mbo 이동 <방출|은퇴|임의해지> <선수명들> <팀> [사유] [날짜]`")
 
 
 def parse_fa_sign_args(args):
-    return parse_players_team_args(args, "사용법: `!mbo 이동 영입 <선수명들> <팀> [날짜]`")
+    return parse_players_team_args(args, "사용법: `!mbo 이동 영입 <선수명들> <팀> [사유] [날짜]`")
 
 
-def commit_simple_movement_sync(kind, team, players, date, author_text):
+def parse_register_args(args):
+    parts = normalize(args).split()
+    if len(parts) < 2:
+        raise ValueError("사용법: `!mbo 등록 <닉네임> <팀>`")
+
+    team = parts[-1].upper()
+    name = " ".join(parts[:-1]).strip()
+
+    if team not in TEAM_META:
+        raise ValueError(f"팀 코드를 확인해주세요: {team}")
+
+    if not name:
+        raise ValueError("등록할 닉네임을 입력해주세요.")
+
+    return name, team
+
+
+def commit_player_registration_sync(name, team, author_text):
+    existing = find_player_sync(name, team)
+    if existing:
+        raise ValueError(f"이미 등록된 선수입니다: {name} ({team})")
+
+    db.collection("players").add(
+        {
+            "name": name,
+            "team": team,
+            "position": "",
+            "number": "",
+            "transfer": f"{today()} Discord 봇 등록: {team}",
+            "createdBy": "discord-python-bot",
+            "createdByName": author_text,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+    )
+
+
+def movement_note(author_text, reason=""):
+    reason = normalize(reason)
+    if reason:
+        return f"Discord 봇 입력: {author_text}\n사유: {reason}"
+    return f"Discord 봇 입력: {author_text}"
+
+
+def commit_simple_movement_sync(kind, team, players, date, author_text, reason=""):
     from_team = team.upper()
     batch = db.batch()
 
@@ -521,7 +595,7 @@ def commit_simple_movement_sync(kind, team, players, date, author_text):
             payload["forcedReleaseOriginalTeam"] = ""
 
         update_player(batch, player, payload)
-        add_movement(batch, kind, name, from_team, "무소속", date, f"Discord 봇 입력: {author_text}", [name], [])
+        add_movement(batch, kind, name, from_team, "무소속", date, movement_note(author_text, reason), [name], [])
 
     batch.commit()
 
@@ -541,7 +615,7 @@ def find_fa_sign_player_sync(name):
     raise ValueError(f"FA 영입은 무소속 선수만 가능합니다: {name} (현재 소속: {teams})")
 
 
-def commit_fa_sign_sync(players, to_team, date, author_text):
+def commit_fa_sign_sync(players, to_team, date, author_text, reason=""):
     to_team = to_team.upper()
     batch = db.batch()
 
@@ -559,7 +633,7 @@ def commit_fa_sign_sync(players, to_team, date, author_text):
                 "transfer": f"{date} FA 영입: {to_team}",
             },
         )
-        add_movement(batch, "FA_SIGN", name, from_team, to_team, date, f"Discord 봇 입력: {author_text}", [name], [])
+        add_movement(batch, "FA_SIGN", name, from_team, to_team, date, movement_note(author_text, reason), [name], [])
 
     batch.commit()
 
@@ -793,6 +867,34 @@ async def role_diagnosis_command(ctx, *, player_name: str = ""):
     await ctx.reply("\n\n".join(lines)[:1900] if lines else "봇이 들어가 있는 서버를 찾지 못했습니다.")
 
 
+@bot.command(name="등록")
+async def register_player_command(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    name, team = parse_register_args(args)
+
+    await run_blocking(
+        commit_player_registration_sync,
+        name,
+        team,
+        str(ctx.author),
+    )
+    await sync_roles_for_player_registration(name, team)
+
+    embed = player_event_embed(
+        {
+            "name": name,
+            "team": team,
+            "position": "",
+            "number": "",
+        }
+    )
+    embed.title = "로스터 등록 승인"
+    embed.set_footer(text="MBOMgr System (승인됨)")
+    await ctx.reply(embed=embed)
+
+
 @bot.command(name="도움말")
 async def help_command(ctx):
     if not await guard(ctx):
@@ -831,6 +933,12 @@ async def help_command(ctx):
     )
 
     embed.add_field(
+        name="!mbo 등록 <닉네임> <팀>",
+        value="선수를 로스터에 등록하고, 닉네임과 일치하는 Discord 멤버에게 팀 역할을 지급합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
         name="자동 역할 동기화",
         value="트레이드/FA/이적은 기존 팀·상태 역할을 제거하고 새 팀 역할을 지급합니다. 방출은 관리 역할을 제거하고, 은퇴/임의탈퇴는 상태 역할을 지급합니다.",
         inline=False,
@@ -850,25 +958,25 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="!mbo 이동 영입 <선수명들> <팀> [날짜]",
+        name="!mbo 이동 영입 <선수명들> <팀> [사유] [날짜]",
         value="무소속 선수를 FA 영입합니다. 여러 명은 쉼표로 구분합니다.",
         inline=False,
     )
 
     embed.add_field(
-        name="!mbo 이동 방출 <선수명들> <팀> [날짜]",
+        name="!mbo 이동 방출 <선수명들> <팀> [사유] [날짜]",
         value="선수를 무소속으로 이동합니다. 여러 명은 쉼표로 구분합니다.",
         inline=False,
     )
 
     embed.add_field(
-        name="!mbo 이동 은퇴 <선수명들> <팀> [날짜]",
+        name="!mbo 이동 은퇴 <선수명들> <팀> [사유] [날짜]",
         value="선수를 무소속으로 이동하고 은퇴 내역을 남깁니다.",
         inline=False,
     )
 
     embed.add_field(
-        name="!mbo 이동 임의해지 <선수명들> <팀> [날짜]",
+        name="!mbo 이동 임의해지 <선수명들> <팀> [사유] [날짜]",
         value="선수를 무소속으로 이동하고 원 소속팀 복귀 제한을 겁니다.",
         inline=False,
     )
@@ -899,7 +1007,7 @@ async def help_command(ctx):
 
     embed.add_field(
         name="영입/방출 예시",
-        value="```!mbo 이동 영입 PlayerName RMS\n!mbo 이동 방출 PlayerName RMS```",
+        value="```!mbo 이동 영입 PlayerName RMS 테스트 참가\n!mbo 이동 방출 PlayerName RMS 개인 사정```",
         inline=False,
     )
 
@@ -974,7 +1082,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
         return
 
     if movement_type in {"영입", "FA영입", "FA_SIGN", "FA"}:
-        to_team, players, date = parse_fa_sign_args(args)
+        to_team, players, date, reason = parse_fa_sign_args(args)
 
         await run_blocking(
             commit_fa_sign_sync,
@@ -982,17 +1090,18 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             to_team,
             date,
             str(ctx.author),
+            reason,
         )
 
         await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
-        embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
+        embed = movement_embed("FA_SIGN", date, "무소속", players, to_team, reason=reason)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
         return
 
     if movement_type == "방출":
-        team, players, date = parse_simple_movement_args(args)
+        team, players, date, reason = parse_simple_movement_args(args)
 
         await run_blocking(
             commit_simple_movement_sync,
@@ -1001,17 +1110,18 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             players,
             date,
             str(ctx.author),
+            reason,
         )
 
         await sync_roles_for_discord_movement("RELEASE", team, players, "무소속", date)
-        embed = movement_embed("RELEASE", date, team, players, "무소속")
+        embed = movement_embed("RELEASE", date, team, players, "무소속", reason=reason)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
         return
 
     if movement_type == "은퇴":
-        team, players, date = parse_simple_movement_args(args)
+        team, players, date, reason = parse_simple_movement_args(args)
 
         await run_blocking(
             commit_simple_movement_sync,
@@ -1020,17 +1130,18 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             players,
             date,
             str(ctx.author),
+            reason,
         )
 
         await sync_roles_for_discord_movement("RETIRE", team, players, "무소속", date)
-        embed = movement_embed("RETIRE", date, team, players, "무소속")
+        embed = movement_embed("RETIRE", date, team, players, "무소속", reason=reason)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
         return
 
     if movement_type in {"임의해지", "임의탈퇴"}:
-        team, players, date = parse_simple_movement_args(args)
+        team, players, date, reason = parse_simple_movement_args(args)
 
         await run_blocking(
             commit_simple_movement_sync,
@@ -1039,10 +1150,11 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             players,
             date,
             str(ctx.author),
+            reason,
         )
 
         await sync_roles_for_discord_movement("FORCED_RELEASE", team, players, "무소속", date)
-        embed = movement_embed("FORCED_RELEASE", date, team, players, "무소속")
+        embed = movement_embed("FORCED_RELEASE", date, team, players, "무소속", reason=reason)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1080,7 +1192,7 @@ async def fa_sign(ctx, *, args: str = ""):
     if not await guard(ctx):
         return
 
-    to_team, players, date = parse_fa_sign_args(args)
+    to_team, players, date, reason = parse_fa_sign_args(args)
 
     await run_blocking(
         commit_fa_sign_sync,
@@ -1088,10 +1200,11 @@ async def fa_sign(ctx, *, args: str = ""):
         to_team,
         date,
         str(ctx.author),
+        reason,
     )
 
     await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
-    embed = movement_embed("FA_SIGN", date, "무소속", players, to_team)
+    embed = movement_embed("FA_SIGN", date, "무소속", players, to_team, reason=reason)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1116,7 +1229,7 @@ async def simple_movement(ctx, kind, args):
     if not await guard(ctx):
         return
 
-    team, players, date = parse_simple_movement_args(args)
+    team, players, date, reason = parse_simple_movement_args(args)
 
     await run_blocking(
         commit_simple_movement_sync,
@@ -1125,10 +1238,11 @@ async def simple_movement(ctx, kind, args):
         players,
         date,
         str(ctx.author),
+        reason,
     )
 
     await sync_roles_for_discord_movement(kind, team, players, "무소속", date)
-    embed = movement_embed(kind, date, team, players, "무소속")
+    embed = movement_embed(kind, date, team, players, "무소속", reason=reason)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1279,7 +1393,10 @@ def start_firestore_watchers():
             data = change.document.to_dict()
             embed = player_event_embed(data)
             actor = data.get("createdByName", "웹/알 수 없음")
-            schedule_from_snapshot(publish_firestore_event("웹 로스터 등록", embed, "웹", actor, True))
+            if data.get("createdBy") == "discord-python-bot":
+                schedule_from_snapshot(publish_firestore_event("Discord 로스터 등록", embed, "Discord", actor, False))
+            else:
+                schedule_from_snapshot(publish_firestore_event("웹 로스터 등록", embed, "웹", actor, True))
 
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("movements").on_snapshot(on_movements_snapshot))
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("players").on_snapshot(on_players_snapshot))
