@@ -10,3 +10,5 @@ pnpm-debug.log*
 firebase-adminsdk-*.json
 *.pem
 *.key
+__pycache__/
+*.py[cod]
