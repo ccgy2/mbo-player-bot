@@ -15,6 +15,10 @@ load_dotenv()
 PREFIX = "!mbo"
 AUTHORIZED_USER_ID = 742989026625060914
 ANNOUNCE_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+LOG_CHANNEL_ID = os.getenv("DISCORD_LOG_CHANNEL_ID")
+CONFIG_REF = None
+SNAPSHOT_UNSUBSCRIBES = []
+SNAPSHOTS_STARTED = False
 
 TEAM_META = {
     "ODV": {"name": "오버드라이브", "color": 0xFF6A00},
@@ -30,6 +34,9 @@ TEAM_META = {
 
 MOVEMENT_LABELS = {
     "TRADE": "트레이드",
+    "FA_SIGN": "FA 영입",
+    "NICKNAME": "닉네임 변경",
+    "TRANSFER": "이적",
     "RELEASE": "방출",
     "RETIRE": "은퇴",
     "FORCED_RELEASE": "임의해지",
@@ -52,12 +59,67 @@ def init_firebase():
 
 
 db = init_firebase()
+CONFIG_REF = db.collection("appMeta").document("discordBot")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX + " ", intents=intents, help_command=None)
+
+def get_bot_config_sync():
+    snapshot = CONFIG_REF.get()
+    return snapshot.to_dict() if snapshot.exists else {}
+
+
+async def get_bot_config():
+    return await asyncio.to_thread(get_bot_config_sync)
+
+
+def set_bot_config_sync(payload):
+    CONFIG_REF.set({**payload, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+
+
+async def set_bot_config(payload):
+    await asyncio.to_thread(set_bot_config_sync, payload)
+
+
+def parse_channel_id(value):
+    text = normalize(value)
+    match = re.search(r"(\d{15,25})", text)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+async def resolve_channel(channel_id):
+    if not channel_id:
+        return None
+    try:
+        return bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+    except Exception as exc:
+        print("채널 조회 실패:", repr(exc))
+        return None
+
+
+async def configured_public_channel_id():
+    config = await get_bot_config()
+    return normalize(config.get("channelId")) or normalize(ANNOUNCE_CHANNEL_ID)
+
+
+async def configured_log_channel_id():
+    config = await get_bot_config()
+    return normalize(config.get("logChannelId")) or normalize(LOG_CHANNEL_ID)
+
+
+async def send_log(title, description="", fields=None, color=0x475569):
+    channel = await resolve_channel(await configured_log_channel_id())
+    if not channel:
+        return
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now(timezone.utc))
+    for name, value, inline in fields or []:
+        embed.add_field(name=name, value=str(value)[:1024] or "-", inline=inline)
+    await channel.send(embed=embed)
 
 
 def normalize(value):
@@ -128,11 +190,7 @@ def validate_forced_return(player, target_team):
 
 
 async def send_announcement(embed):
-    if not ANNOUNCE_CHANNEL_ID:
-        return
-
-    channel = bot.get_channel(int(ANNOUNCE_CHANNEL_ID)) or await bot.fetch_channel(int(ANNOUNCE_CHANNEL_ID))
-
+    channel = await resolve_channel(await configured_public_channel_id())
     if channel:
         await channel.send(embed=embed)
 
@@ -252,7 +310,7 @@ def commit_simple_movement_sync(kind, team, players, date, author_text):
             payload["forcedReleaseOriginalTeam"] = ""
 
         update_player(batch, player, payload)
-        add_movement(batch, kind, name, from_team, "무소속", date, f"Discord Python 봇 입력: {author_text}", [name], [])
+        add_movement(batch, kind, name, from_team, "무소속", date, f"Discord 봇 입력: {author_text}", [name], [])
 
     batch.commit()
 
@@ -334,12 +392,77 @@ def fetch_recent_movements_sync():
     return [doc.to_dict() for doc in docs]
 
 
+
+
+@bot.before_invoke
+async def log_discord_command(ctx):
+    if is_authorized(ctx):
+        await send_log(
+            "Discord 명령어 실행",
+            f"{ctx.author} 님이 명령어를 실행했습니다.",
+            [("실행자", f"{ctx.author} ({ctx.author.id})", False), ("명령어", ctx.message.content[:1000], False), ("채널", ctx.channel.mention, True)],
+            0x475569,
+        )
+
+@bot.command(name="채널")
+async def set_public_channel_command(ctx, action: str = "", channel_text: str = ""):
+    if not await guard(ctx):
+        return
+    if normalize(action) != "설정":
+        await ctx.reply("사용법: `!mbo 채널 설정 <#채널>`")
+        return
+    channel_id = parse_channel_id(channel_text)
+    if not channel_id:
+        await ctx.reply("설정할 채널을 멘션해주세요. 예: `!mbo 채널 설정 #공지채널`")
+        return
+    await set_bot_config({"channelId": channel_id})
+    await ctx.reply(f"웹/Discord 공지 채널을 <#{channel_id}> 로 설정했습니다.")
+    await send_log(
+        "공지 채널 설정",
+        f"{ctx.author} 님이 공지 채널을 <#{channel_id}> 로 설정했습니다.",
+        [("실행자", f"{ctx.author} ({ctx.author.id})", False), ("채널", f"<#{channel_id}>", False)],
+        0x0F766E,
+    )
+
+
+@bot.command(name="로그채널")
+async def set_log_channel_command(ctx, action: str = "", channel_text: str = ""):
+    if not await guard(ctx):
+        return
+    if normalize(action) != "설정":
+        await ctx.reply("사용법: `!mbo 로그채널 설정 <#채널>`")
+        return
+    channel_id = parse_channel_id(channel_text)
+    if not channel_id:
+        await ctx.reply("설정할 채널을 멘션해주세요. 예: `!mbo 로그채널 설정 #로그채널`")
+        return
+    await set_bot_config({"logChannelId": channel_id})
+    await ctx.reply(f"로그 채널을 <#{channel_id}> 로 설정했습니다.")
+    await send_log(
+        "로그 채널 설정",
+        f"{ctx.author} 님이 로그 채널을 <#{channel_id}> 로 설정했습니다.",
+        [("실행자", f"{ctx.author} ({ctx.author.id})", False), ("채널", f"<#{channel_id}>", False)],
+        0x0F766E,
+    )
+
 @bot.command(name="도움말")
 async def help_command(ctx):
     if not await guard(ctx):
         return
 
     embed = discord.Embed(title="MBO Python 봇 명령어", color=0x0F766E)
+
+    embed.add_field(
+        name="!mbo 채널 설정 <#채널>",
+        value="웹/Discord에서 발생한 선수 이동, 로스터 등록 등 공지를 보낼 채널을 설정합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!mbo 로그채널 설정 <#채널>",
+        value="누가 언제 웹 또는 Discord에서 작업했는지 기록할 로그 채널을 설정합니다.",
+        inline=False,
+    )
 
     embed.add_field(
         name="!mbo 이동 트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
@@ -633,6 +756,96 @@ async def validate_roster(ctx, *, lineup_text: str = ""):
     await ctx.reply(embed=embed)
 
 
+
+
+def movement_event_embed(data):
+    kind = data.get("type", "이동")
+    label = MOVEMENT_LABELS.get(kind, kind)
+    from_team = data.get("fromTeam", "-")
+    to_team = data.get("toTeam", "-")
+    route = f"{from_team} -> {to_team}"
+    if kind == "RELEASE":
+        route = f"{from_team} -> 방출"
+    elif kind == "RETIRE":
+        route = f"{from_team} -> 은퇴"
+    elif kind == "FORCED_RELEASE":
+        route = f"{from_team} -> 임의해지"
+    elif kind == "NICKNAME":
+        route = f"{from_team} 닉네임 변경"
+    embed = discord.Embed(title=f"{label} 등록", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="경로", value=route, inline=False)
+    embed.add_field(name="선수", value=data.get("playerName") or ", ".join(data.get("fromPlayers", [])) or "-", inline=False)
+    embed.add_field(name="이동일", value=data.get("date", "-"), inline=True)
+    embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
+    if data.get("note"):
+        embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
+    return embed
+
+
+def player_event_embed(data):
+    team = data.get("team", "팀 미정")
+    embed = discord.Embed(title="로스터 등록", color=team_color(team), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="선수", value=data.get("name", "-"), inline=True)
+    embed.add_field(name="팀", value=team, inline=True)
+    embed.add_field(name="포지션", value=data.get("position") or "-", inline=True)
+    if data.get("number"):
+        embed.add_field(name="등번호", value=data.get("number"), inline=True)
+    return embed
+
+
+async def publish_firestore_event(title, embed, source, actor="-", announce=True):
+    if announce:
+        await send_announcement(embed)
+    await send_log(
+        title,
+        f"{source}에서 발생한 이벤트입니다.",
+        [("발생 위치", source, True), ("처리자", actor or "-", True)],
+        embed.color.value if embed.color else 0x475569,
+    )
+
+
+def schedule_from_snapshot(coro):
+    if not bot.loop.is_closed():
+        asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+
+def start_firestore_watchers():
+    global SNAPSHOTS_STARTED
+    if SNAPSHOTS_STARTED:
+        return
+    SNAPSHOTS_STARTED = True
+    state = {"movements_initial": True, "players_initial": True}
+
+    def on_movements_snapshot(col_snapshot, changes, read_time):
+        if state["movements_initial"]:
+            state["movements_initial"] = False
+            return
+        for change in changes:
+            if change.type.name != "ADDED":
+                continue
+            data = change.document.to_dict()
+            embed = movement_event_embed(data)
+            actor = data.get("createdByName", "웹/알 수 없음")
+            if data.get("createdBy") == "discord-python-bot":
+                schedule_from_snapshot(publish_firestore_event("Discord 선수 이동", embed, "Discord", actor, False))
+            else:
+                schedule_from_snapshot(publish_firestore_event("웹 선수 이동", embed, "웹", actor, True))
+
+    def on_players_snapshot(col_snapshot, changes, read_time):
+        if state["players_initial"]:
+            state["players_initial"] = False
+            return
+        for change in changes:
+            if change.type.name != "ADDED":
+                continue
+            data = change.document.to_dict()
+            embed = player_event_embed(data)
+            actor = data.get("createdByName", "웹/알 수 없음")
+            schedule_from_snapshot(publish_firestore_event("웹 로스터 등록", embed, "웹", actor, True))
+
+    SNAPSHOT_UNSUBSCRIBES.append(db.collection("movements").on_snapshot(on_movements_snapshot))
+    SNAPSHOT_UNSUBSCRIBES.append(db.collection("players").on_snapshot(on_players_snapshot))
+
 @bot.event
 async def on_command_error(ctx, error):
     original = getattr(error, "original", error)
@@ -659,6 +872,7 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
+    start_firestore_watchers()
     print(f"MBO Python 봇 준비됨: {bot.user}")
 
 
