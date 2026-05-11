@@ -279,7 +279,7 @@ async def sync_member_roles_for_movement(data):
 
 
 async def sync_roles_for_discord_movement(kind, from_team, players, to_team, date, to_players=None):
-    await sync_member_roles_for_movement(
+    return await sync_member_roles_for_movement(
         {
             "type": kind,
             "playerName": ", ".join(players),
@@ -292,6 +292,16 @@ async def sync_roles_for_discord_movement(kind, from_team, players, to_team, dat
             "createdByName": "Discord Python Bot",
         }
     )
+
+
+def add_role_sync_result(embed, results):
+    problems = [
+        result
+        for result in results or []
+        if any(pattern in result for pattern in ["멤버를 찾지 못함", "권한 부족", "역할을 찾지 못함"])
+    ]
+    if problems:
+        embed.add_field(name="역할 처리 확인", value="\n".join(problems)[:1024], inline=False)
 
 
 async def sync_roles_for_player_registration(name, team):
@@ -880,7 +890,7 @@ async def register_player_command(ctx, *, args: str = ""):
         team,
         str(ctx.author),
     )
-    await sync_roles_for_player_registration(name, team)
+    role_results = await sync_roles_for_player_registration(name, team)
 
     embed = player_event_embed(
         {
@@ -892,6 +902,7 @@ async def register_player_command(ctx, *, args: str = ""):
     )
     embed.title = "로스터 등록 승인"
     embed.set_footer(text="MBOMgr System (승인됨)")
+    add_role_sync_result(embed, role_results)
     await ctx.reply(embed=embed)
 
 
@@ -1074,8 +1085,9 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             str(ctx.author),
         )
 
-        await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
+        role_results = await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
         embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
+        add_role_sync_result(embed, role_results)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1093,8 +1105,9 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             reason,
         )
 
-        await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
+        role_results = await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
         embed = movement_embed("FA_SIGN", date, "무소속", players, to_team, reason=reason)
+        add_role_sync_result(embed, role_results)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1113,8 +1126,9 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             reason,
         )
 
-        await sync_roles_for_discord_movement("RELEASE", team, players, "무소속", date)
+        role_results = await sync_roles_for_discord_movement("RELEASE", team, players, "무소속", date)
         embed = movement_embed("RELEASE", date, team, players, "무소속", reason=reason)
+        add_role_sync_result(embed, role_results)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1133,8 +1147,9 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             reason,
         )
 
-        await sync_roles_for_discord_movement("RETIRE", team, players, "무소속", date)
+        role_results = await sync_roles_for_discord_movement("RETIRE", team, players, "무소속", date)
         embed = movement_embed("RETIRE", date, team, players, "무소속", reason=reason)
+        add_role_sync_result(embed, role_results)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1153,8 +1168,9 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
             reason,
         )
 
-        await sync_roles_for_discord_movement("FORCED_RELEASE", team, players, "무소속", date)
+        role_results = await sync_roles_for_discord_movement("FORCED_RELEASE", team, players, "무소속", date)
         embed = movement_embed("FORCED_RELEASE", date, team, players, "무소속", reason=reason)
+        add_role_sync_result(embed, role_results)
 
         await ctx.reply(embed=embed)
         await send_announcement(embed)
@@ -1180,8 +1196,9 @@ async def trade(ctx, *, args: str = ""):
         str(ctx.author),
     )
 
-    await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
+    role_results = await sync_roles_for_discord_movement("TRADE", from_team, from_players, to_team, date, to_players)
     embed = movement_embed("TRADE", date, from_team, from_players, to_team, to_players)
+    add_role_sync_result(embed, role_results)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1203,8 +1220,9 @@ async def fa_sign(ctx, *, args: str = ""):
         reason,
     )
 
-    await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
+    role_results = await sync_roles_for_discord_movement("FA_SIGN", "무소속", players, to_team, date)
     embed = movement_embed("FA_SIGN", date, "무소속", players, to_team, reason=reason)
+    add_role_sync_result(embed, role_results)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1241,8 +1259,9 @@ async def simple_movement(ctx, kind, args):
         reason,
     )
 
-    await sync_roles_for_discord_movement(kind, team, players, "무소속", date)
+    role_results = await sync_roles_for_discord_movement(kind, team, players, "무소속", date)
     embed = movement_embed(kind, date, team, players, "무소속", reason=reason)
+    add_role_sync_result(embed, role_results)
 
     await ctx.reply(embed=embed)
     await send_announcement(embed)
@@ -1314,18 +1333,19 @@ def movement_event_embed(data):
         player_lines = from_players + to_players
         from_lines = [from_team] * len(from_players) + [to_team] * len(to_players)
         to_lines = [to_team] * len(from_players) + [from_team] * len(to_players)
-    elif kind == "NICKNAME" and to_players:
-        player_lines = from_players
-        from_lines = from_players
-        to_lines = to_players
     else:
         player_lines = from_players
         from_lines = [from_team] * len(from_players)
         to_lines = [movement_target_label(kind, to_team)] * len(from_players)
 
-    embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
-    embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
-    embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
+    if kind == "NICKNAME" and to_players:
+        embed.add_field(name="이전 닉네임", value="\n".join(from_players) or "-", inline=True)
+        embed.add_field(name="새 닉네임", value="\n".join(to_players) or "-", inline=True)
+        embed.add_field(name="소속", value=from_team or "-", inline=True)
+    else:
+        embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
+        embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
+        embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
     embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
     if data.get("note"):
         embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
