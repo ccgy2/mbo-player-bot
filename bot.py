@@ -1,6 +1,8 @@
 import os
 import re
 import asyncio
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -55,6 +57,7 @@ MOVEMENT_LABELS = {
     "RELEASE": "방출",
     "RETIRE": "은퇴",
     "FORCED_RELEASE": "임의해지",
+    "REGISTER": "로스터 등록",
 }
 
 
@@ -135,6 +138,14 @@ def merge_role_config(config):
 
 async def configured_role_ids():
     return merge_role_config(await get_bot_config())
+
+
+def merge_team_owners(config):
+    return {team.upper(): normalize(owner_id) for team, owner_id in (config.get("teamOwners") or {}).items()}
+
+
+async def configured_team_owners():
+    return merge_team_owners(await get_bot_config())
 
 
 async def resolve_channel(channel_id):
@@ -383,6 +394,29 @@ async def guard(ctx):
     return False
 
 
+async def can_request_for_team(ctx, team):
+    if is_authorized(ctx):
+        return True
+    owners = await configured_team_owners()
+    return normalize(owners.get(normalize(team).upper())) == str(ctx.author.id)
+
+
+async def guard_team_request(ctx, team):
+    if await can_request_for_team(ctx, team):
+        return True
+    await ctx.reply(f"{team} 구단주 또는 관리자만 이 요청을 만들 수 있습니다.")
+    return False
+
+
+async def guard_trade_request(ctx, from_team, to_team):
+    if is_authorized(ctx):
+        return True
+    if await can_request_for_team(ctx, from_team) or await can_request_for_team(ctx, to_team):
+        return True
+    await ctx.reply(f"{from_team} 또는 {to_team} 구단주만 트레이드 요청을 만들 수 있습니다.")
+    return False
+
+
 async def run_blocking(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -435,17 +469,15 @@ def movement_embed(kind, date, from_team, players, to_team="", to_players=None, 
     embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
 
     if kind == "TRADE" and to_players:
-        player_lines = players + to_players
-        from_lines = [from_team] * len(players) + [to_team] * len(to_players)
-        to_lines = [to_team] * len(players) + [from_team] * len(to_players)
+        player_text = f"{', '.join(players)} ↔ {', '.join(to_players)}"
+        team_text = f"{from_team} ↔ {to_team}"
     else:
-        player_lines = players
-        from_lines = [from_team] * len(players)
-        to_lines = [movement_target_label(kind, to_team)] * len(players)
+        player_text = ", ".join(players)
+        team_text = f"{from_team} → {movement_target_label(kind, to_team)}"
 
-    embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
-    embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
-    embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
+    embed.add_field(name="선수", value=player_text or "-", inline=False)
+    embed.add_field(name="팀", value=team_text, inline=True)
+    embed.add_field(name="날짜", value=date or "-", inline=True)
     if normalize(reason):
         embed.add_field(name="사유", value=normalize(reason)[:1024], inline=False)
     embed.set_footer(text="MBOMgr System (승인됨)")
@@ -478,6 +510,13 @@ def movement_request_embed(request_no, payload):
             value="\n".join([payload.get("toTeam", "-")] * len(from_players) + [payload.get("fromTeam", "-")] * len(to_players)) or "-",
             inline=True,
         )
+    elif kind == "NICKNAME":
+        embed.add_field(name="이전 닉네임", value=payload.get("oldName", "-"), inline=True)
+        embed.add_field(name="새 닉네임", value=payload.get("newName", "-"), inline=True)
+        embed.add_field(name="소속", value=payload.get("team", "-"), inline=True)
+    elif kind == "REGISTER":
+        embed.add_field(name="선수", value=payload.get("name", "-"), inline=True)
+        embed.add_field(name="팀", value=payload.get("team", "-"), inline=True)
     else:
         players = payload.get("players", [])
         embed.add_field(name="선수", value="\n".join(players) or "-", inline=True)
@@ -511,33 +550,42 @@ def add_movement(batch, kind, player_name, from_team, to_team, date, note, from_
     )
 
 
-def next_request_number_sync(request_date):
+def format_request_number(generation, value):
+    if generation <= 0:
+        return f"{value:04d}"
+    return f"{generation}-{value:04d}"
+
+
+def next_request_number_sync():
     snapshot = CONFIG_REF.get()
     config = snapshot.to_dict() if snapshot.exists else {}
-    if normalize(config.get("requestCounterDate")) != request_date:
-        next_value = 1
-    else:
-        next_value = int(config.get("requestCounterValue") or 0) + 1
+    generation = int(config.get("requestCounterGeneration") or 0)
+    value = int(config.get("requestCounterValue") or 0) + 1
+
+    if generation <= 0 and value > 9999:
+        generation = 1
+        value = 0
+    elif generation > 0 and value > 9999:
+        generation += 1
+        value = 0
 
     CONFIG_REF.set(
         {
-            "requestCounterDate": request_date,
-            "requestCounterValue": next_value,
+            "requestCounterGeneration": generation,
+            "requestCounterValue": value,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
     )
-    return f"{next_value:04d}"
+    return format_request_number(generation, value)
 
 
 def create_movement_request_sync(payload):
-    request_date = today()
-    request_no = next_request_number_sync(request_date)
-    request_id = f"{request_date}-{request_no}"
+    request_no = next_request_number_sync()
+    request_id = request_no
     db.collection("movementRequests").document(request_id).set(
         {
             "requestNo": request_no,
-            "requestDate": request_date,
             "status": "PENDING",
             "payload": payload,
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -548,10 +596,10 @@ def create_movement_request_sync(payload):
 
 
 def fetch_pending_request_sync(request_no):
-    request_id = f"{today()}-{request_no}"
+    request_id = normalize(request_no)
     snapshot = db.collection("movementRequests").document(request_id).get()
     if not snapshot.exists:
-        raise ValueError(f"오늘 날짜의 승인 대기 요청을 찾지 못했습니다: {request_no}")
+        raise ValueError(f"승인 대기 요청을 찾지 못했습니다: {request_no}")
 
     data = snapshot.to_dict()
     if data.get("status") != "PENDING":
@@ -565,6 +613,18 @@ def mark_request_approved_sync(request_id, approver_text):
             "status": "APPROVED",
             "approvedBy": approver_text,
             "approvedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+
+def mark_request_denied_sync(request_id, denier_text):
+    db.collection("movementRequests").document(request_id).set(
+        {
+            "status": "DENIED",
+            "deniedBy": denier_text,
+            "deniedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
@@ -671,6 +731,24 @@ def parse_register_args(args):
     return name, team
 
 
+def parse_nickname_args(args):
+    parts = normalize(args).split()
+    if len(parts) < 4:
+        raise ValueError("사용법: `!닉네임변경 <이전닉> <새로운닉> <팀명> <날짜>`")
+
+    old_name = parts[0]
+    new_name = parts[1]
+    team = parts[2].upper()
+    date = parts[3]
+
+    if team not in TEAM_META or team == "무소속":
+        raise ValueError(f"팀 코드를 확인해주세요: {team}")
+    if not is_date(date):
+        raise ValueError("날짜는 YYYY-MM-DD 형식으로 입력해주세요.")
+
+    return old_name, new_name, team, date
+
+
 def commit_player_registration_sync(name, team, author_text):
     existing = find_player_sync(name, team)
     if existing:
@@ -689,6 +767,38 @@ def commit_player_registration_sync(name, team, author_text):
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }
     )
+
+
+def commit_nickname_change_sync(old_name, new_name, team, date, author_text):
+    player = find_player_sync(old_name, team)
+    if not player:
+        raise ValueError(f"선수 목록에 없는 선수입니다: {old_name} ({team})")
+
+    existing = find_player_sync(new_name, team)
+    if existing:
+        raise ValueError(f"이미 같은 팀에 존재하는 닉네임입니다: {new_name} ({team})")
+
+    batch = db.batch()
+    update_player(
+        batch,
+        player,
+        {
+            "name": new_name,
+            "transfer": f"{date} {old_name} → {new_name} 닉네임 변경",
+        },
+    )
+    add_movement(
+        batch,
+        "NICKNAME",
+        old_name,
+        team,
+        team,
+        date,
+        f"Discord 봇 입력: {author_text}",
+        [old_name],
+        [new_name],
+    )
+    batch.commit()
 
 
 def movement_note(author_text, reason=""):
@@ -733,6 +843,20 @@ def approve_movement_request_sync(request_id, payload, approver_text):
             payload.get("date"),
             approver_text,
             payload.get("reason", ""),
+        )
+    elif kind == "NICKNAME":
+        commit_nickname_change_sync(
+            payload.get("oldName"),
+            payload.get("newName"),
+            payload.get("team"),
+            payload.get("date"),
+            approver_text,
+        )
+    elif kind == "REGISTER":
+        commit_player_registration_sync(
+            payload.get("name"),
+            payload.get("team"),
+            approver_text,
         )
     else:
         raise ValueError(f"승인할 수 없는 이동 유형입니다: {kind}")
@@ -881,6 +1005,57 @@ def commit_trade_sync(from_team, from_players, to_team, to_players, date, author
 def fetch_recent_movements_sync():
     docs = db.collection("movements").order_by("date", direction=firestore.Query.DESCENDING).limit(5).stream()
     return [doc.to_dict() for doc in docs]
+
+
+def fetch_team_roster_sync(team):
+    docs = db.collection("players").where("team", "==", team).stream()
+    players = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+    return sorted(players, key=lambda player: normalize(player.get("name")).lower())
+
+
+def roster_txt_bytes(team, players):
+    lines = [f"{team} 로스터", ""]
+    for index, player in enumerate(players, start=1):
+        lines.append(
+            f"{index}. {normalize(player.get('name'))}"
+            f" | 포지션: {normalize(player.get('position')) or '-'}"
+            f" | 등번호: {normalize(player.get('number')) or '-'}"
+        )
+    return "\n".join(lines).encode("utf-8")
+
+
+def roster_csv_bytes(players):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["닉네임", "팀", "포지션", "등번호", "이동내역"])
+    for player in players:
+        writer.writerow(
+            [
+                normalize(player.get("name")),
+                normalize(player.get("team")),
+                normalize(player.get("position")),
+                normalize(player.get("number")),
+                normalize(player.get("transfer")),
+            ]
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+class RosterDownloadView(discord.ui.View):
+    def __init__(self, team, players):
+        super().__init__(timeout=300)
+        self.team = team
+        self.players = players
+
+    @discord.ui.button(label="TXT 다운로드", style=discord.ButtonStyle.secondary)
+    async def download_txt(self, interaction, button):
+        file = discord.File(io.BytesIO(roster_txt_bytes(self.team, self.players)), filename=f"roster_{self.team}.txt")
+        await interaction.response.send_message(file=file, ephemeral=True)
+
+    @discord.ui.button(label="Excel CSV 다운로드", style=discord.ButtonStyle.primary)
+    async def download_csv(self, interaction, button):
+        file = discord.File(io.BytesIO(roster_csv_bytes(self.players)), filename=f"roster_{self.team}.csv")
+        await interaction.response.send_message(file=file, ephemeral=True)
 
 
 
@@ -1035,33 +1210,60 @@ async def role_diagnosis_command(ctx, *, player_name: str = ""):
     await ctx.reply("\n\n".join(lines)[:1900] if lines else "봇이 들어가 있는 서버를 찾지 못했습니다.")
 
 
-@bot.command(name="등록")
-async def register_player_command(ctx, *, args: str = ""):
+@bot.command(name="구단주")
+async def set_team_owner_command(ctx, member_text: str = "", team_text: str = ""):
     if not await guard(ctx):
         return
 
+    owner_id = parse_user_id(member_text)
+    team = normalize(team_text).upper()
+    if not owner_id or team not in TEAM_META or team == "무소속":
+        await ctx.reply("사용법: `!구단주 <@플레이어> <팀명>`")
+        return
+
+    config = await get_bot_config()
+    owners = merge_team_owners(config)
+    owners[team] = owner_id
+    await set_bot_config({"teamOwners": owners})
+    await ctx.reply(f"{team} 구단주를 <@{owner_id}> 로 설정했습니다.")
+
+
+@bot.command(name="등록")
+async def register_player_command(ctx, *, args: str = ""):
     name, team = parse_register_args(args)
-
-    await run_blocking(
-        commit_player_registration_sync,
-        name,
-        team,
-        str(ctx.author),
-    )
-    role_results = await sync_roles_for_player_registration(name, team)
-
-    embed = player_event_embed(
+    await create_movement_request(
+        ctx,
         {
+            "kind": "REGISTER",
             "name": name,
             "team": team,
-            "position": "",
-            "number": "",
-        }
+            "date": today(),
+            "requesterId": str(ctx.author.id),
+            "requesterName": str(ctx.author),
+        },
     )
-    embed.title = "로스터 등록 승인"
-    embed.set_footer(text="MBOMgr System (승인됨)")
-    add_role_sync_result(embed, role_results)
-    await ctx.reply(embed=embed)
+
+
+@bot.command(name="닉네임변경", aliases=["닉변"])
+async def nickname_change_command(ctx, *, args: str = ""):
+    old_name, new_name, team, date = parse_nickname_args(args)
+    if not await guard_team_request(ctx, team):
+        return
+
+    await create_movement_request(
+        ctx,
+        {
+            "kind": "NICKNAME",
+            "oldName": old_name,
+            "newName": new_name,
+            "team": team,
+            "fromTeam": team,
+            "toTeam": team,
+            "date": date,
+            "requesterId": str(ctx.author.id),
+            "requesterName": str(ctx.author),
+        },
+    )
 
 
 @bot.command(name="승인")
@@ -1112,6 +1314,18 @@ async def approve_request_command(ctx, admin_text: str = "", request_no: str = "
             payload.get("toTeam"),
             payload.get("toPlayers", []),
         )
+    elif kind == "NICKNAME":
+        role_results = []
+        embed = discord.Embed(title="🔄 닉네임 변경 승인", color=team_color(payload.get("team")), timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="변경", value=f"{payload.get('oldName', '-')} → {payload.get('newName', '-')}", inline=False)
+        embed.add_field(name="팀", value=payload.get("team", "-"), inline=True)
+        embed.add_field(name="날짜", value=payload.get("date", "-"), inline=True)
+        embed.set_footer(text="MBOMgr System (승인됨)")
+    elif kind == "REGISTER":
+        role_results = await sync_roles_for_player_registration(payload.get("name"), payload.get("team"))
+        embed = player_event_embed({"name": payload.get("name"), "team": payload.get("team")})
+        embed.title = "로스터 등록 승인"
+        embed.set_footer(text="MBOMgr System (승인됨)")
     else:
         players = payload.get("players", [])
         to_team = payload.get("toTeam", "무소속")
@@ -1124,6 +1338,37 @@ async def approve_request_command(ctx, admin_text: str = "", request_no: str = "
     add_role_sync_result(embed, role_results)
     await ctx.reply(embed=embed)
     await send_announcement(embed)
+
+
+@bot.command(name="거부")
+async def deny_request_command(ctx, admin_text: str = "", request_no: str = ""):
+    if not await guard(ctx):
+        return
+
+    admin_id = parse_user_id(admin_text)
+    request_no = normalize(request_no)
+    if not admin_id or not request_no:
+        await ctx.reply("사용법: `!거부 <@관리자디스코드> <요청번호>`")
+        return
+
+    if admin_id != str(ctx.author.id):
+        await ctx.reply("최종 거부자는 명령을 실행한 관리자 본인을 멘션해주세요.")
+        return
+
+    denier = ctx.guild.get_member(int(admin_id)) if ctx.guild else None
+    if not is_authorized_member(denier):
+        await ctx.reply("멘션한 사용자는 거부 권한이 없습니다.")
+        return
+
+    request_id, request_data = await run_blocking(fetch_pending_request_sync, request_no)
+    await run_blocking(mark_request_denied_sync, request_id, str(ctx.author))
+    payload = request_data.get("payload") or {}
+    label = MOVEMENT_LABELS.get(payload.get("kind"), payload.get("kind", "요청"))
+    embed = discord.Embed(title=f"🚫 {label} 요청 거부", color=0xEF4444, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="요청번호", value=request_no, inline=True)
+    embed.add_field(name="거부자", value=ctx.author.mention, inline=True)
+    embed.set_footer(text="MBOMgr System (거부됨)")
+    await ctx.reply(embed=embed)
 
 
 @bot.command(name="도움말")
@@ -1175,6 +1420,24 @@ async def help_command(ctx):
         inline=False,
     )
 
+    embed.add_field(
+        name="!거부 <@관리자디스코드> <요청번호>",
+        value="승인 대기 요청을 거부합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!구단주 <@플레이어> <팀명>",
+        value="팀 구단주를 지정합니다. 구단주는 자기 팀 영입/방출/은퇴/임의해지를 요청할 수 있습니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!로스터 <팀명>",
+        value="팀 전체 로스터를 보여주고 TXT/Excel CSV 다운로드 버튼을 제공합니다.",
+        inline=False,
+    )
+
 
     embed.add_field(
         name="!트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
@@ -1203,6 +1466,12 @@ async def help_command(ctx):
     embed.add_field(
         name="!임의해지 <선수명들> <팀> [사유] [날짜]",
         value="임의해지 승인 요청을 만듭니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!닉네임변경 <이전닉> <새로운닉> <팀명> <날짜>",
+        value="닉네임 변경 승인 요청을 만듭니다.",
         inline=False,
     )
 
@@ -1279,12 +1548,40 @@ async def recent_movements(ctx, *unused):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="로스터")
+async def roster_command(ctx, team_text: str = ""):
+    team = normalize(team_text).upper()
+    if team not in TEAM_META:
+        await ctx.reply("사용법: `!로스터 <팀명>`")
+        return
+
+    players = await run_blocking(fetch_team_roster_sync, team)
+    embed = discord.Embed(title=f"{team} 로스터", color=team_color(team), timestamp=datetime.now(timezone.utc))
+    embed.description = f"총 {len(players)}명"
+    if players:
+        lines = [
+            f"{index}. {normalize(player.get('name'))}"
+            f" · {normalize(player.get('position')) or '-'}"
+            f" · No.{normalize(player.get('number')) or '-'}"
+            for index, player in enumerate(players[:20], start=1)
+        ]
+        embed.add_field(name="선수 목록", value="\n".join(lines), inline=False)
+        if len(players) > 20:
+            embed.add_field(name="안내", value="20명까지만 미리 표시합니다. 전체 명단은 다운로드 버튼을 사용하세요.", inline=False)
+    else:
+        embed.description = "등록된 선수가 없습니다."
+
+    await ctx.reply(embed=embed, view=RosterDownloadView(team, players))
+
+
 @bot.command(name="이동")
 async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
     movement_type = normalize(movement_type)
 
     if movement_type == "트레이드":
         from_team, from_players, to_team, to_players, date = parse_trade_args(args)
+        if not await guard_trade_request(ctx, from_team, to_team):
+            return
         await create_movement_request(
             ctx,
             {
@@ -1302,6 +1599,8 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 
     if movement_type in {"영입", "FA영입", "FA_SIGN", "FA"}:
         to_team, players, date, reason = parse_fa_sign_args(args)
+        if not await guard_team_request(ctx, to_team):
+            return
         await create_movement_request(
             ctx,
             {
@@ -1319,6 +1618,8 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 
     if movement_type == "방출":
         team, players, date, reason = parse_simple_movement_args(args)
+        if not await guard_team_request(ctx, team):
+            return
         await create_movement_request(
             ctx,
             {
@@ -1336,6 +1637,8 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 
     if movement_type == "은퇴":
         team, players, date, reason = parse_simple_movement_args(args)
+        if not await guard_team_request(ctx, team):
+            return
         await create_movement_request(
             ctx,
             {
@@ -1353,6 +1656,8 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 
     if movement_type in {"임의해지", "임의탈퇴"}:
         team, players, date, reason = parse_simple_movement_args(args)
+        if not await guard_team_request(ctx, team):
+            return
         await create_movement_request(
             ctx,
             {
@@ -1374,6 +1679,8 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 @bot.command(name="트레이드")
 async def trade(ctx, *, args: str = ""):
     from_team, from_players, to_team, to_players, date = parse_trade_args(args)
+    if not await guard_trade_request(ctx, from_team, to_team):
+        return
     await create_movement_request(
         ctx,
         {
@@ -1392,6 +1699,8 @@ async def trade(ctx, *, args: str = ""):
 @bot.command(name="영입", aliases=["FA영입", "FA"])
 async def fa_sign(ctx, *, args: str = ""):
     to_team, players, date, reason = parse_fa_sign_args(args)
+    if not await guard_team_request(ctx, to_team):
+        return
     await create_movement_request(
         ctx,
         {
@@ -1424,6 +1733,8 @@ async def forced_release(ctx, *, args: str = ""):
 
 async def simple_movement(ctx, kind, args):
     team, players, date, reason = parse_simple_movement_args(args)
+    if not await guard_team_request(ctx, team):
+        return
     await create_movement_request(
         ctx,
         {
