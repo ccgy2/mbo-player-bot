@@ -1,8 +1,9 @@
 import os
 import re
 import asyncio
-import csv
 import io
+import zipfile
+from xml.sax.saxutils import escape as escape_xml
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -1024,21 +1025,70 @@ def roster_txt_bytes(team, players):
     return "\n".join(lines).encode("utf-8")
 
 
-def roster_csv_bytes(players):
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["닉네임", "팀", "포지션", "등번호", "이동내역"])
-    for player in players:
-        writer.writerow(
-            [
-                normalize(player.get("name")),
-                normalize(player.get("team")),
-                normalize(player.get("position")),
-                normalize(player.get("number")),
-                normalize(player.get("transfer")),
-            ]
-        )
-    return output.getvalue().encode("utf-8-sig")
+def xlsx_cell(column, row, value):
+    return f'<c r="{column}{row}" t="inlineStr"><is><t>{escape_xml(normalize(value))}</t></is></c>'
+
+
+def roster_xlsx_bytes(team, players):
+    rows = [["순번", "닉네임", "팀", "포지션", "등번호", "이동내역"]]
+    rows.extend(
+        [
+            str(index),
+            player.get("name"),
+            player.get("team"),
+            player.get("position"),
+            player.get("number"),
+            player.get("transfer"),
+        ]
+        for index, player in enumerate(players, start=1)
+    )
+    sheet_rows = []
+    for row_index, values in enumerate(rows, start=1):
+        cells = "".join(xlsx_cell(chr(64 + column_index), row_index, value) for column_index, value in enumerate(values, start=1))
+        sheet_rows.append(f'<row r="{row_index}">{cells}</row>')
+
+    files = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            "</Types>"
+        ),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>"
+        ),
+        "xl/workbook.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheets><sheet name="{escape_xml(team)}" sheetId="1" r:id="rId1"/></sheets>'
+            "</workbook>"
+        ),
+        "xl/_rels/workbook.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>"
+        ),
+        "xl/worksheets/sheet1.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"<sheetData>{''.join(sheet_rows)}</sheetData>"
+            "</worksheet>"
+        ),
+    }
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as workbook:
+        for path, content in files.items():
+            workbook.writestr(path, content)
+    return output.getvalue()
 
 
 class RosterDownloadView(discord.ui.View):
@@ -1052,9 +1102,9 @@ class RosterDownloadView(discord.ui.View):
         file = discord.File(io.BytesIO(roster_txt_bytes(self.team, self.players)), filename=f"roster_{self.team}.txt")
         await interaction.response.send_message(file=file, ephemeral=True)
 
-    @discord.ui.button(label="Excel CSV 다운로드", style=discord.ButtonStyle.primary)
-    async def download_csv(self, interaction, button):
-        file = discord.File(io.BytesIO(roster_csv_bytes(self.players)), filename=f"roster_{self.team}.csv")
+    @discord.ui.button(label="XLSX 다운로드", style=discord.ButtonStyle.primary)
+    async def download_xlsx(self, interaction, button):
+        file = discord.File(io.BytesIO(roster_xlsx_bytes(self.team, self.players)), filename=f"roster_{self.team}.xlsx")
         await interaction.response.send_message(file=file, ephemeral=True)
 
 
@@ -1433,8 +1483,8 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="!로스터 <팀명>",
-        value="팀 전체 로스터를 보여주고 TXT/Excel CSV 다운로드 버튼을 제공합니다.",
+        name="!팀로스터 <팀명> / !로스터 <팀명>",
+        value="현재 해당 팀 소속 선수만 보여주고 TXT/XLSX 다운로드 버튼을 제공합니다.",
         inline=False,
     )
 
@@ -1548,11 +1598,11 @@ async def recent_movements(ctx, *unused):
     await ctx.reply(embed=embed)
 
 
-@bot.command(name="로스터")
+@bot.command(name="로스터", aliases=["팀로스터"])
 async def roster_command(ctx, team_text: str = ""):
     team = normalize(team_text).upper()
     if team not in TEAM_META:
-        await ctx.reply("사용법: `!로스터 <팀명>`")
+        await ctx.reply("사용법: `!팀로스터 <팀명>`")
         return
 
     players = await run_blocking(fetch_team_roster_sync, team)
