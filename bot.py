@@ -1,7 +1,10 @@
 import os
 import re
 import asyncio
+import csv
+import hashlib
 import io
+import urllib.request
 import zipfile
 from xml.sax.saxutils import escape as escape_xml
 from datetime import datetime, timedelta, timezone
@@ -22,6 +25,9 @@ LOG_CHANNEL_ID = os.getenv("DISCORD_LOG_CHANNEL_ID")
 CONFIG_REF = None
 SNAPSHOT_UNSUBSCRIBES = []
 SNAPSHOTS_STARTED = False
+PUNISHMENT_SYNC_STARTED = False
+PUNISHMENT_SHEET_ID = "1kf6UP4zCvL6drY4GN9CIhwM97f10aIGrlpRzYESuqgU"
+PUNISHMENT_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{PUNISHMENT_SHEET_ID}/export?format=csv"
 
 DEFAULT_ROLE_IDS = {
     "teams": {
@@ -63,6 +69,12 @@ MOVEMENT_LABELS = {
 
 
 def init_firebase():
+    json_path = os.path.abspath(os.path.join(os.getcwd(), "..", "mbo-player-firebase-adminsdk-fbsvc-4ce86ceba5.json"))
+    if os.path.exists(json_path):
+        cred = credentials.Certificate(json_path)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+
     private_key = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
     cred = credentials.Certificate(
         {
@@ -1033,8 +1045,112 @@ def punishment_payload(nickname, team, reason, penalty, note, date=None, release
     }
 
 
+def is_roster_removal_punishment(record):
+    text = " ".join(
+        normalize(record.get(key))
+        for key in ["status", "penalty", "note", "releaseDateText", "releaseDate"]
+    )
+    if "중" not in normalize(record.get("status")):
+        return False
+    if normalize(record.get("pardon")):
+        return False
+    return any(keyword in text for keyword in ["영구 제명", "서버 접속 금지", "무기한"])
+
+
+def punishment_roster_text(record):
+    date = normalize(record.get("dateText") or record.get("date")) or today()
+    reason = normalize(record.get("reason")) or "-"
+    penalty = normalize(record.get("penalty")) or "-"
+    note = normalize(record.get("note"))
+    suffix = f" ({note})" if note else ""
+    return f"{date} 처벌: {reason} / {penalty}{suffix}"
+
+
+def apply_roster_removal_for_punishment(batch, record):
+    if not is_roster_removal_punishment(record):
+        return False
+    player = find_player_sync(record.get("nickname"))
+    if not player:
+        return False
+    if normalize(player.get("team")) == "무소속" and normalize(player.get("transfer")) == punishment_roster_text(record):
+        return False
+    update_player(
+        batch,
+        player,
+        {
+            "team": "무소속",
+            "transfer": punishment_roster_text(record),
+            "forcedReleaseOriginalTeam": "",
+        },
+    )
+    return True
+
+
 def add_punishment_sync(payload):
-    db.collection("punishments").add(payload)
+    batch = db.batch()
+    batch.set(db.collection("punishments").document(), payload)
+    apply_roster_removal_for_punishment(batch, payload)
+    batch.commit()
+
+
+def sheet_record_id(record):
+    key = "|".join(
+        normalize(record.get(key))
+        for key in ["status", "dateText", "team", "nickname", "reason", "penalty", "releaseDateText", "note", "pardon"]
+    )
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def parse_sheet_date(text):
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", normalize(text))
+    return match.group(1) if match else normalize(text)
+
+
+def punishment_records_from_sheet_sync():
+    raw = urllib.request.urlopen(PUNISHMENT_SHEET_CSV_URL, timeout=30).read().decode("utf-8-sig")
+    rows = list(csv.reader(io.StringIO(raw)))
+    records = []
+    for row in rows[2:]:
+        row = row + [""] * 10
+        status, date_text, team, nickname, reason, penalty, release_text, note, pardon = [
+            normalize(item) for item in row[1:10]
+        ]
+        if not nickname or status == "-":
+            continue
+        records.append(
+            {
+                "status": status,
+                "date": parse_sheet_date(date_text),
+                "dateText": date_text,
+                "team": team,
+                "nickname": nickname,
+                "reason": reason,
+                "penalty": penalty,
+                "releaseDate": parse_sheet_date(release_text),
+                "releaseDateText": release_text,
+                "note": note,
+                "pardon": pardon,
+                "source": "google-sheet-import",
+                "sourceSheetId": PUNISHMENT_SHEET_ID,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    return records
+
+
+def sync_punishments_from_sheet_sync():
+    records = punishment_records_from_sheet_sync()
+    synced = 0
+    removed = 0
+    for start in range(0, len(records), 200):
+        batch = db.batch()
+        for record in records[start : start + 200]:
+            batch.set(db.collection("punishments").document(sheet_record_id(record)), record, merge=True)
+            if apply_roster_removal_for_punishment(batch, record):
+                removed += 1
+            synced += 1
+        batch.commit()
+    return synced, removed
 
 
 def fetch_punishments_sync(query_text):
@@ -2233,6 +2349,22 @@ def player_event_embed(data):
     return embed
 
 
+def punishment_event_embed(data):
+    embed = discord.Embed(
+        title="처벌 기록 등록",
+        color=0xEF4444 if "중" in normalize(data.get("status")) else 0x0F766E,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="대상", value=f"{normalize(data.get('nickname')) or '-'} ({normalize(data.get('team')) or '팀 미정'})", inline=False)
+    embed.add_field(name="징계 여부", value=normalize(data.get("status")) or "-", inline=True)
+    embed.add_field(name="징계 일자", value=normalize(data.get("dateText") or data.get("date")) or "-", inline=True)
+    embed.add_field(name="처벌", value=f"{normalize(data.get('reason')) or '-'} -> {normalize(data.get('penalty')) or '-'}", inline=False)
+    embed.add_field(name="해제", value=normalize(data.get("releaseDateText") or data.get("releaseDate")) or "-", inline=True)
+    if normalize(data.get("note")):
+        embed.add_field(name="비고", value=normalize(data.get("note"))[:1024], inline=False)
+    return embed
+
+
 async def publish_firestore_event(title, embed, source, actor="-", announce=True):
     if announce:
         await send_announcement(embed)
@@ -2254,7 +2386,7 @@ def start_firestore_watchers():
     if SNAPSHOTS_STARTED:
         return
     SNAPSHOTS_STARTED = True
-    state = {"movements_initial": True, "players_initial": True}
+    state = {"movements_initial": True, "players_initial": True, "punishments_initial": True}
 
     def on_movements_snapshot(col_snapshot, changes, read_time):
         if state["movements_initial"]:
@@ -2287,8 +2419,41 @@ def start_firestore_watchers():
             else:
                 schedule_from_snapshot(publish_firestore_event("웹 로스터 등록", embed, "웹", actor, True))
 
+    def on_punishments_snapshot(col_snapshot, changes, read_time):
+        if state["punishments_initial"]:
+            state["punishments_initial"] = False
+            return
+        for change in changes:
+            if change.type.name != "ADDED":
+                continue
+            data = change.document.to_dict()
+            embed = punishment_event_embed(data)
+            actor = data.get("createdByName", "웹/시트")
+            source = "Google Sheet" if data.get("source") == "google-sheet-import" else "웹/Discord"
+            schedule_from_snapshot(publish_firestore_event("처벌 기록 등록", embed, source, actor, True))
+
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("movements").on_snapshot(on_movements_snapshot))
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("players").on_snapshot(on_players_snapshot))
+    SNAPSHOT_UNSUBSCRIBES.append(db.collection("punishments").on_snapshot(on_punishments_snapshot))
+
+
+async def punishment_sheet_sync_loop():
+    while not bot.is_closed():
+        try:
+            synced, removed = await run_blocking(sync_punishments_from_sheet_sync)
+            print(f"처벌 시트 동기화 완료: {synced}건, 로스터 제외 {removed}건")
+        except Exception as exc:
+            print("처벌 시트 동기화 실패:", repr(exc))
+        await asyncio.sleep(600)
+
+
+def start_punishment_sheet_sync():
+    global PUNISHMENT_SYNC_STARTED
+    if PUNISHMENT_SYNC_STARTED:
+        return
+    PUNISHMENT_SYNC_STARTED = True
+    bot.loop.create_task(punishment_sheet_sync_loop())
+
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -2317,6 +2482,7 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_ready():
     start_firestore_watchers()
+    start_punishment_sheet_sync()
     print(f"MBO Python 봇 준비됨: {bot.user}")
 
 
