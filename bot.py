@@ -1008,6 +1008,75 @@ def fetch_recent_movements_sync():
     return [doc.to_dict() for doc in docs]
 
 
+def find_player_team_by_name_sync(name):
+    player = find_player_sync(name)
+    return normalize(player.get("team")) if player else ""
+
+
+def punishment_payload(nickname, team, reason, penalty, note, date=None, release_date="", status="징계 중", author_text=""):
+    return {
+        "status": normalize(status) or "징계 중",
+        "date": normalize(date) or today(),
+        "dateText": normalize(date) or today(),
+        "team": normalize(team),
+        "nickname": normalize(nickname),
+        "reason": normalize(reason),
+        "penalty": normalize(penalty),
+        "releaseDate": normalize(release_date),
+        "releaseDateText": normalize(release_date),
+        "note": normalize(note),
+        "pardon": "",
+        "createdBy": "discord-python-bot",
+        "createdByName": author_text or "Discord Python Bot",
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+
+def add_punishment_sync(payload):
+    db.collection("punishments").add(payload)
+
+
+def fetch_punishments_sync(query_text):
+    query_text = normalize(query_text)
+    docs = db.collection("punishments").order_by("date", direction=firestore.Query.DESCENDING).stream()
+    records = [doc.to_dict() for doc in docs]
+    if not query_text:
+        return records
+
+    lowered = query_text.lower()
+    uppered = query_text.upper()
+    nickname_matches = [record for record in records if normalize(record.get("nickname")).lower() == lowered]
+    team_matches = [record for record in records if normalize(record.get("team")).upper() == uppered]
+    return nickname_matches or team_matches
+
+
+def punishment_summary(records):
+    active = [record for record in records if "중" in normalize(record.get("status"))]
+    return len(records), len(active)
+
+
+def punishment_embed(title, records):
+    total, active_count = punishment_summary(records)
+    embed = discord.Embed(title=title, color=0xEF4444 if active_count else 0x0F766E, timestamp=datetime.now(timezone.utc))
+    embed.description = f"총 처벌 기록 {total}건 · 징계 중 {active_count}건"
+    for index, record in enumerate(records[:10], start=1):
+        embed.add_field(
+            name=f"{index}. {normalize(record.get('dateText') or record.get('date')) or '-'} · {normalize(record.get('status')) or '-'}",
+            value=(
+                f"{normalize(record.get('nickname')) or '-'} ({normalize(record.get('team')) or '팀 미정'})\n"
+                f"{normalize(record.get('reason')) or '-'} -> {normalize(record.get('penalty')) or '-'}\n"
+                f"해제: {normalize(record.get('releaseDateText') or record.get('releaseDate')) or '-'}"
+            ),
+            inline=False,
+        )
+    if len(records) > 10:
+        embed.add_field(name="안내", value="10건까지만 표시합니다.", inline=False)
+    if not records:
+        embed.add_field(name="내역", value="처벌 기록이 없습니다.", inline=False)
+    return embed
+
+
 def fetch_team_roster_sync(team):
     docs = db.collection("players").where("team", "==", team).stream()
     players = [{"id": doc.id, **doc.to_dict()} for doc in docs]
@@ -1696,6 +1765,18 @@ async def help_command(ctx):
         inline=False,
     )
 
+    embed.add_field(
+        name="!처벌기록 <닉네임 또는 팀명>",
+        value="해당 선수 또는 팀의 총 처벌 기록과 현재 징계 여부를 조회합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!처벌 <처벌사유> <닉네임> <자세한 처벌내용> <징계일>",
+        value="처벌 기록을 등록합니다. 예: `!처벌 욕설 PlayerName 심한 욕설 3일침묵`",
+        inline=False,
+    )
+
 
     embed.add_field(
         name="!트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
@@ -1845,6 +1926,38 @@ async def transfer_info_command(ctx, *, player_name: str = ""):
         return
 
     await ctx.reply(embed=transfer_info_embed(player, movements), view=TransferInfoDownloadView(player, movements))
+
+
+@bot.command(name="처벌기록")
+async def punishment_record_command(ctx, *, query_text: str = ""):
+    query_text = normalize(query_text)
+    if not query_text:
+        await ctx.reply("사용법: `!처벌기록 <닉네임 또는 팀명>`")
+        return
+
+    records = await run_blocking(fetch_punishments_sync, query_text)
+    title = f"{query_text} 처벌 기록"
+    await ctx.reply(embed=punishment_embed(title, records))
+
+
+@bot.command(name="처벌")
+async def punishment_command(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    parts = normalize(args).split()
+    if len(parts) < 4:
+        await ctx.reply("사용법: `!처벌 <처벌사유> <닉네임> <자세한 처벌내용> <징계일>`")
+        return
+
+    reason = parts[0]
+    nickname = parts[1]
+    penalty = parts[-1]
+    note = " ".join(parts[2:-1])
+    team = await run_blocking(find_player_team_by_name_sync, nickname)
+    payload = punishment_payload(nickname, team, reason, penalty, note, author_text=str(ctx.author))
+    await run_blocking(add_punishment_sync, payload)
+    await ctx.reply(embed=punishment_embed(f"{nickname} 처벌 등록", [payload]))
 
 
 @bot.command(name="이동")
