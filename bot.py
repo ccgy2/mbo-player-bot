@@ -1054,7 +1054,7 @@ def is_roster_removal_punishment(record):
         return False
     if normalize(record.get("pardon")):
         return False
-    return any(keyword in text for keyword in ["영구 제명", "서버 접속 금지", "무기한"])
+    return "영구제명" in re.sub(r"\s+", "", text)
 
 
 def punishment_roster_text(record):
@@ -1086,10 +1086,72 @@ def apply_roster_removal_for_punishment(batch, record):
     return True
 
 
+def revert_roster_removal_for_punishment(batch, record):
+    if not is_roster_removal_punishment(record):
+        return False
+    player = find_player_sync(record.get("nickname"))
+    original_team = normalize(record.get("team"))
+    if not player or not original_team:
+        return False
+    if normalize(player.get("team")) != "무소속" or normalize(player.get("transfer")) != punishment_roster_text(record):
+        return False
+    update_player(
+        batch,
+        player,
+        {
+            "team": original_team,
+            "transfer": "",
+            "forcedReleaseOriginalTeam": "",
+        },
+    )
+    return True
+
+
 def add_punishment_sync(payload):
     batch = db.batch()
     batch.set(db.collection("punishments").document(), payload)
     apply_roster_removal_for_punishment(batch, payload)
+    batch.commit()
+
+
+def resolve_punishment_doc_sync(punishment_id):
+    key = normalize(punishment_id)
+    if not key:
+        raise ValueError("처벌 기록 ID를 입력해주세요.")
+
+    direct_ref = db.collection("punishments").document(key)
+    direct_snapshot = direct_ref.get()
+    if direct_snapshot.exists:
+        return direct_ref, direct_snapshot.to_dict()
+
+    matches = []
+    for doc_snapshot in db.collection("punishments").stream():
+        if doc_snapshot.id.startswith(key):
+            matches.append((doc_snapshot.reference, doc_snapshot.to_dict()))
+
+    if not matches:
+        raise ValueError(f"처벌 기록을 찾지 못했습니다: {key}")
+    if len(matches) > 1:
+        raise ValueError(f"처벌 기록 ID가 여러 개와 일치합니다. 더 길게 입력해주세요: {key}")
+    return matches[0]
+
+
+def update_punishment_sync(punishment_id, payload):
+    ref, previous = resolve_punishment_doc_sync(punishment_id)
+    batch = db.batch()
+    revert_roster_removal_for_punishment(batch, previous)
+    payload = {**payload, "updatedAt": firestore.SERVER_TIMESTAMP}
+    payload.pop("createdAt", None)
+    batch.update(ref, payload)
+    apply_roster_removal_for_punishment(batch, payload)
+    batch.commit()
+
+
+def delete_punishment_sync(punishment_id):
+    ref, previous = resolve_punishment_doc_sync(punishment_id)
+    batch = db.batch()
+    revert_roster_removal_for_punishment(batch, previous)
+    batch.delete(ref)
     batch.commit()
 
 
@@ -1156,7 +1218,7 @@ def sync_punishments_from_sheet_sync():
 def fetch_punishments_sync(query_text):
     query_text = normalize(query_text)
     docs = db.collection("punishments").order_by("date", direction=firestore.Query.DESCENDING).stream()
-    records = [doc.to_dict() for doc in docs]
+    records = [{"id": doc.id, **doc.to_dict()} for doc in docs]
     if not query_text:
         return records
 
@@ -1180,6 +1242,7 @@ def punishment_embed(title, records):
         embed.add_field(
             name=f"{index}. {normalize(record.get('dateText') or record.get('date')) or '-'} · {normalize(record.get('status')) or '-'}",
             value=(
+                f"ID: `{normalize(record.get('id'))[:8] or '-'}`\n"
                 f"{normalize(record.get('nickname')) or '-'} ({normalize(record.get('team')) or '팀 미정'})\n"
                 f"{normalize(record.get('reason')) or '-'} -> {normalize(record.get('penalty')) or '-'}\n"
                 f"해제: {normalize(record.get('releaseDateText') or record.get('releaseDate')) or '-'}"
@@ -1893,6 +1956,18 @@ async def help_command(ctx):
         inline=False,
     )
 
+    embed.add_field(
+        name="!처벌수정 <처벌ID> <처벌사유> <닉네임> <자세한 처벌내용> <징계내용>",
+        value="처벌기록에서 보이는 ID로 처벌 기록을 수정합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="!처벌삭제 <처벌ID>",
+        value="처벌기록에서 보이는 ID로 처벌 기록을 삭제합니다.",
+        inline=False,
+    )
+
 
     embed.add_field(
         name="!트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
@@ -2074,6 +2149,40 @@ async def punishment_command(ctx, *, args: str = ""):
     payload = punishment_payload(nickname, team, reason, penalty, note, author_text=str(ctx.author))
     await run_blocking(add_punishment_sync, payload)
     await ctx.reply(embed=punishment_embed(f"{nickname} 처벌 등록", [payload]))
+
+
+@bot.command(name="처벌수정")
+async def punishment_update_command(ctx, punishment_id: str = "", *, args: str = ""):
+    if not await guard(ctx):
+        return
+
+    parts = normalize(args).split()
+    if not punishment_id or len(parts) < 4:
+        await ctx.reply("사용법: `!처벌수정 <처벌ID> <처벌사유> <닉네임> <자세한 처벌내용> <징계내용>`")
+        return
+
+    reason = parts[0]
+    nickname = parts[1]
+    penalty = parts[-1]
+    note = " ".join(parts[2:-1])
+    team = await run_blocking(find_player_team_by_name_sync, nickname)
+    payload = punishment_payload(nickname, team, reason, penalty, note, author_text=str(ctx.author))
+    await run_blocking(update_punishment_sync, punishment_id, payload)
+    await ctx.reply(embed=punishment_embed(f"{nickname} 처벌 수정", [{"id": punishment_id, **payload}]))
+
+
+@bot.command(name="처벌삭제")
+async def punishment_delete_command(ctx, punishment_id: str = ""):
+    if not await guard(ctx):
+        return
+
+    punishment_id = normalize(punishment_id)
+    if not punishment_id:
+        await ctx.reply("사용법: `!처벌삭제 <처벌ID>`")
+        return
+
+    await run_blocking(delete_punishment_sync, punishment_id)
+    await ctx.reply(f"처벌 기록 `{punishment_id}` 을 삭제했습니다.")
 
 
 @bot.command(name="이동")
