@@ -511,7 +511,7 @@ def movement_embed(kind, date, from_team, players, to_team="", to_players=None, 
     embed.add_field(name="날짜", value=date or "-", inline=True)
     if normalize(reason):
         embed.add_field(name="사유", value=normalize(reason)[:1024], inline=False)
-    embed.set_footer(text="MBOMgr System (승인됨)")
+    embed.set_footer(text="KMBLeague System (승인됨)")
     return embed
 
 
@@ -1838,12 +1838,12 @@ async def approve_request_command(ctx, admin_text: str = "", request_no: str = "
         embed.add_field(name="변경", value=f"{payload.get('oldName', '-')} → {payload.get('newName', '-')}", inline=False)
         embed.add_field(name="팀", value=payload.get("team", "-"), inline=True)
         embed.add_field(name="날짜", value=payload.get("date", "-"), inline=True)
-        embed.set_footer(text="MBOMgr System (승인됨)")
+        embed.set_footer(text="KMBLeague System (승인됨)")
     elif kind == "REGISTER":
         role_results = await sync_roles_for_player_registration(payload.get("name"), payload.get("team"))
         embed = player_event_embed({"name": payload.get("name"), "team": payload.get("team")})
         embed.title = "로스터 등록 승인"
-        embed.set_footer(text="MBOMgr System (승인됨)")
+        embed.set_footer(text="KMBLeague System (승인됨)")
     else:
         players = payload.get("players", [])
         to_team = payload.get("toTeam", "무소속")
@@ -1885,7 +1885,7 @@ async def deny_request_command(ctx, admin_text: str = "", request_no: str = ""):
     embed = discord.Embed(title=f"🚫 {label} 요청 거부", color=0xEF4444, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="요청번호", value=request_no, inline=True)
     embed.add_field(name="거부자", value=ctx.author.mention, inline=True)
-    embed.set_footer(text="MBOMgr System (거부됨)")
+    embed.set_footer(text="KMBLeague System (거부됨)")
     await ctx.reply(embed=embed)
 
 
@@ -2478,7 +2478,7 @@ def movement_event_embed(data):
     embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
     if data.get("note"):
         embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
-    embed.set_footer(text="MBOMgr System (승인됨)")
+    embed.set_footer(text="KMBLeague System (승인됨)")
     return embed
 
 
