@@ -30,30 +30,14 @@ PUNISHMENT_SHEET_ID = "1kf6UP4zCvL6drY4GN9CIhwM97f10aIGrlpRzYESuqgU"
 PUNISHMENT_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{PUNISHMENT_SHEET_ID}/export?format=csv"
 
 DEFAULT_ROLE_IDS = {
-    "teams": {
-        "RMS": "1467379371059974442",
-        "NDG": "1467379373169705003",
-        "CPX": "1467379373504987136",
-        "IH": "1467379375954460901",
-        "KRA": "1467884269669056747",
-        "PLT": "1467885245016703039",
-        "ODV": "1467886778194333874",
-        "SLU": "1467907005229302094",
-    },
+    "teams": {},
     "retire": "1486690482250846350",
     "forcedRelease": "1486690539012231178",
 }
 
-TEAM_META = {
-    "ODV": {"name": "오버드라이브", "color": 0xFF6A00},
-    "RMS": {"name": "레이 마린스", "color": 0xC9982C},
-    "NDG": {"name": "나이트 드래곤즈", "color": 0x2B2B2B},
-    "CPX": {"name": "청화 피닉스", "color": 0x1B65BA},
-    "IH": {"name": "아이언 호네츠", "color": 0xFEC804},
-    "KRA": {"name": "크라켄즈", "color": 0xC00000},
-    "PLT": {"name": "클로베츠 플랜츠", "color": 0x0CB218},
-    "SLU": {"name": "브레이브 슬러거즈", "color": 0x850000},
-    "무소속": {"name": "무소속", "color": 0x64748B},
+FREE_AGENT_TEAM = "무소속"
+DEFAULT_TEAM_META = {
+    FREE_AGENT_TEAM: {"name": FREE_AGENT_TEAM, "color": 0x64748B},
 }
 
 MOVEMENT_LABELS = {
@@ -378,8 +362,42 @@ def names_from_value(value):
     return parse_names(value)
 
 
+def parse_hex_color(value):
+    text = normalize(value)
+    if not text:
+        return None
+    if not text.startswith("#"):
+        text = f"#{text}"
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", text):
+        return None
+    return int(text[1:], 16)
+
+
+def team_meta_sync():
+    meta = dict(DEFAULT_TEAM_META)
+    try:
+        docs = db.collection("clubs").stream()
+        for doc_snapshot in docs:
+            data = doc_snapshot.to_dict()
+            name = normalize(data.get("name"))
+            color = parse_hex_color(data.get("color"))
+            if name and color is not None:
+                meta[name.upper()] = {"name": name, "color": color}
+    except Exception as exc:
+        print("팀 목록 조회 실패:", repr(exc))
+    return meta
+
+
+def valid_team_sync(team, allow_free_agent=False):
+    key = normalize(team).upper()
+    if allow_free_agent and key == FREE_AGENT_TEAM:
+        return True
+    return key in team_meta_sync() and key != FREE_AGENT_TEAM
+
+
 def team_color(team):
-    return TEAM_META.get(team, {}).get("color", 0x0F766E)
+    key = normalize(team).upper()
+    return team_meta_sync().get(key, {}).get("color", 0x0F766E)
 
 
 def is_authorized(ctx):
@@ -691,11 +709,11 @@ def parse_players_team_args(args, usage):
     if len(parts) < 2:
         raise ValueError(usage)
 
-    if parts[0].upper() in TEAM_META:
+    if valid_team_sync(parts[0]):
         team = parts[0].upper()
         players_text = " ".join(parts[1:])
     else:
-        team_index = next((index for index, part in enumerate(parts[1:], start=1) if part.upper() in TEAM_META), -1)
+        team_index = next((index for index, part in enumerate(parts[1:], start=1) if valid_team_sync(part)), -1)
         if team_index < 0:
             team = parts[-1].upper()
             players_text = " ".join(parts[:-1])
@@ -705,10 +723,10 @@ def parse_players_team_args(args, usage):
             players_text = " ".join(parts[:team_index])
             reason = " ".join(parts[team_index + 1 :])
 
-    if team not in TEAM_META or team == "무소속":
+    if not valid_team_sync(team):
         raise ValueError(f"팀 코드를 확인해주세요: {team}")
 
-    if parts[0].upper() in TEAM_META:
+    if valid_team_sync(parts[0]):
         reason = ""
 
     players = parse_names(players_text)
@@ -735,7 +753,7 @@ def parse_register_args(args):
     team = parts[-1].upper()
     name = " ".join(parts[:-1]).strip()
 
-    if team not in TEAM_META:
+    if not valid_team_sync(team, allow_free_agent=True):
         raise ValueError(f"팀 코드를 확인해주세요: {team}")
 
     if not name:
@@ -754,7 +772,7 @@ def parse_nickname_args(args):
     team = parts[2].upper()
     date = parts[3]
 
-    if team not in TEAM_META or team == "무소속":
+    if not valid_team_sync(team):
         raise ValueError(f"팀 코드를 확인해주세요: {team}")
     if not is_date(date):
         raise ValueError("날짜는 YYYY-MM-DD 형식으로 입력해주세요.")
@@ -1619,6 +1637,11 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
 
     category = normalize(category)
     role_ids = await configured_role_ids()
+    special_map = {
+        "은퇴": "retire",
+        "임의탈퇴": "forcedRelease",
+        "임의해지": "forcedRelease",
+    }
 
     if category in {"목록", "리스트"}:
         lines = [f"{team}: <@&{role_id}>" for team, role_id in sorted(role_ids["teams"].items())]
@@ -1630,11 +1653,11 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
     if category == "팀":
         team = normalize(team_or_role).upper()
         role_id = parse_role_id(role_text)
-        if team not in TEAM_META or team == "무소속":
-            await ctx.reply("팀 코드를 확인해주세요. 예: `!역할 팀 RMS @역할`")
+        if not team or team == FREE_AGENT_TEAM:
+            await ctx.reply("팀명을 확인해주세요. 예: `!역할 팀 DSP @역할`")
             return
         if not role_id:
-            await ctx.reply("역할을 멘션해주세요. 예: `!역할 팀 RMS @역할`")
+            await ctx.reply("역할을 멘션해주세요. 예: `!역할 팀 DSP @역할`")
             return
         role_ids["teams"][team] = role_id
         await set_bot_config({"roleIds": role_ids})
@@ -1642,11 +1665,11 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
         await send_log("팀 역할 설정", f"{ctx.author} 님이 {team} 역할을 <@&{role_id}> 로 설정했습니다.", [], 0x0F766E)
         return
 
-    if category.upper() in TEAM_META and category != "무소속":
+    if category and category not in special_map:
         team = category.upper()
         role_id = parse_role_id(team_or_role)
         if not role_id:
-            await ctx.reply("역할을 멘션해주세요. 예: `!역할 RMS @역할`")
+            await ctx.reply("역할을 멘션해주세요. 예: `!역할 DSP @역할`")
             return
         role_ids["teams"][team] = role_id
         await set_bot_config({"roleIds": role_ids})
@@ -1654,11 +1677,6 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
         await send_log("팀 역할 설정", f"{ctx.author} 님이 {team} 역할을 <@&{role_id}> 로 설정했습니다.", [], 0x0F766E)
         return
 
-    special_map = {
-        "은퇴": "retire",
-        "임의탈퇴": "forcedRelease",
-        "임의해지": "forcedRelease",
-    }
     if category in special_map:
         role_id = parse_role_id(team_or_role)
         if not role_id:
@@ -1717,7 +1735,7 @@ async def set_team_owner_command(ctx, member_text: str = "", team_text: str = ""
 
     owner_id = parse_user_id(member_text)
     team = normalize(team_text).upper()
-    if not owner_id or team not in TEAM_META or team == "무소속":
+    if not owner_id or not valid_team_sync(team):
         await ctx.reply("사용법: `!구단주 <@플레이어> <팀명>`")
         return
 
@@ -1892,7 +1910,7 @@ async def help_command(ctx):
 
     embed.add_field(
         name="!역할 팀 <팀코드> <@역할>",
-        value="팀별 Discord 역할을 설정합니다. 예: `!역할 팀 RMS @RMS`",
+        value="팀별 Discord 역할을 설정합니다. 예: `!역할 팀 DSP @DSP`",
         inline=False,
     )
 
@@ -2025,13 +2043,13 @@ async def help_command(ctx):
 
     embed.add_field(
         name="트레이드 예시",
-        value="```!트레이드 CPX papaya_yaru ODV KR_Windy, chan_seu1_12 2026-05-05```",
+        value="```!트레이드 DSP PlayerA ABC PlayerB 2026-05-05```",
         inline=False,
     )
 
     embed.add_field(
         name="영입/방출 예시",
-        value="```!영입 PlayerName RMS 테스트 참가\n!방출 PlayerName RMS 개인 사정\n!승인 @관리자 0001```",
+        value="```!영입 PlayerName DSP 테스트 참가\n!방출 PlayerName DSP 개인 사정\n!승인 @관리자 0001```",
         inline=False,
     )
 
@@ -2040,6 +2058,23 @@ async def help_command(ctx):
         value="```!유효성검사\n1. Axrq__ CF\n2번 CUCCl 1B\n3. _w0nyu1 LF```",
         inline=False,
     )
+
+    if len(embed.fields) > 25:
+        fields = list(embed.fields)
+        pages = []
+        for index in range(0, len(fields), 25):
+            page = discord.Embed(
+                title="MBO Python 봇 명령어" if index == 0 else "MBO Python 봇 명령어 계속",
+                color=0x0F766E,
+            )
+            for field in fields[index : index + 25]:
+                page.add_field(name=field.name, value=field.value, inline=field.inline)
+            pages.append(page)
+
+        await ctx.reply(embed=pages[0])
+        for page in pages[1:]:
+            await ctx.send(embed=page)
+        return
 
     await ctx.reply(embed=embed)
 
@@ -2081,7 +2116,7 @@ async def recent_movements(ctx, *unused):
 @bot.command(name="로스터", aliases=["팀로스터"])
 async def roster_command(ctx, team_text: str = ""):
     team = normalize(team_text).upper()
-    if team not in TEAM_META:
+    if not valid_team_sync(team):
         await ctx.reply("사용법: `!팀로스터 <팀명>`")
         return
 
