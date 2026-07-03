@@ -167,6 +167,11 @@ async def configured_log_channel_id():
     return normalize(config.get("logChannelId")) or normalize(LOG_CHANNEL_ID)
 
 
+async def configured_punishment_channel_id():
+    config = await get_bot_config()
+    return normalize(config.get("punishmentChannelId")) or await configured_public_channel_id()
+
+
 async def send_log(title, description="", fields=None, color=0x475569):
     channel = await resolve_channel(await configured_log_channel_id())
     if not channel:
@@ -494,6 +499,12 @@ def validate_forced_return(player, target_team):
 
 async def send_announcement(embed):
     channel = await resolve_channel(await configured_public_channel_id())
+    if channel:
+        await channel.send(embed=embed)
+
+
+async def send_punishment_announcement(embed):
+    channel = await resolve_channel(await configured_punishment_channel_id())
     if channel:
         await channel.send(embed=embed)
 
@@ -1816,7 +1827,7 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
         return
 
     await ctx.reply(
-        "사용법: `!역할 팀 <팀코드> <@역할>`, `!역할 은퇴 <@역할>`, "
+        "사용법: `!역할 팀 <팀코드> <@역할>`, `!역할 구단주 <@역할>`, `!역할 은퇴 <@역할>`, "
         "`!역할 임의탈퇴 <@역할>`, `!역할 목록`"
     )
 
@@ -2041,12 +2052,6 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="!역할 구단주 <@역할>",
-        value="구단주 전용 명령어를 사용할 Discord 역할을 설정합니다.",
-        inline=False,
-    )
-
-    embed.add_field(
         name="!역할 은퇴 <@역할> / !역할 임의탈퇴 <@역할>",
         value="은퇴, 임의탈퇴 상태 역할을 설정합니다. 현재 설정은 `!역할 목록`으로 확인합니다.",
         inline=False,
@@ -2121,7 +2126,7 @@ async def help_command(ctx):
 
     embed.add_field(
         name="!트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
-        value="양 팀이 각각 반대로 요청해야 승인 대기로 올라갑니다. 받는 선수는 쉼표로 여러 명 입력할 수 있습니다.",
+        value="트레이드 승인 요청을 만듭니다. 받는 선수는 쉼표로 여러 명 입력할 수 있습니다.",
         inline=False,
     )
 
@@ -2624,6 +2629,17 @@ async def publish_firestore_event(title, embed, source, actor="-", announce=True
     )
 
 
+async def publish_punishment_firestore_event(title, embed, source, actor="-", announce=True):
+    if announce:
+        await send_punishment_announcement(embed)
+    await send_log(
+        title,
+        f"{source}에서 발생한 이벤트입니다.",
+        [("발생 위치", source, True), ("처리자", actor or "-", True)],
+        embed.color.value if embed.color else 0x475569,
+    )
+
+
 def schedule_from_snapshot(coro):
     if not bot.loop.is_closed():
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
@@ -2678,7 +2694,7 @@ def start_firestore_watchers():
             embed = punishment_event_embed(data)
             actor = data.get("createdByName", "웹/시트")
             source = "Google Sheet" if data.get("source") == "google-sheet-import" else "웹/Discord"
-            schedule_from_snapshot(publish_firestore_event("처벌 기록 등록", embed, source, actor, True))
+            schedule_from_snapshot(publish_punishment_firestore_event("처벌 기록 등록", embed, source, actor, True))
 
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("movements").on_snapshot(on_movements_snapshot))
     SNAPSHOT_UNSUBSCRIBES.append(db.collection("players").on_snapshot(on_players_snapshot))
