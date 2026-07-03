@@ -33,6 +33,7 @@ DEFAULT_ROLE_IDS = {
     "teams": {},
     "retire": "1486690482250846350",
     "forcedRelease": "1486690539012231178",
+    "owner": "",
 }
 
 FREE_AGENT_TEAM = "무소속"
@@ -130,6 +131,7 @@ def merge_role_config(config):
         "teams": {**DEFAULT_ROLE_IDS["teams"], **saved_teams},
         "retire": normalize(saved.get("retire")) or DEFAULT_ROLE_IDS["retire"],
         "forcedRelease": normalize(saved.get("forcedRelease")) or DEFAULT_ROLE_IDS["forcedRelease"],
+        "owner": normalize(saved.get("owner")) or DEFAULT_ROLE_IDS["owner"],
     }
 
 
@@ -425,8 +427,20 @@ async def guard(ctx):
     return False
 
 
+async def has_owner_role(member):
+    if not member:
+        return False
+    role_ids = await configured_role_ids()
+    owner_role_id = normalize(role_ids.get("owner"))
+    if not owner_role_id:
+        return False
+    return any(str(role.id) == owner_role_id for role in getattr(member, "roles", []))
+
+
 async def can_request_for_team(ctx, team):
     if is_authorized(ctx):
+        return True
+    if await has_owner_role(ctx.author):
         return True
     owners = await configured_team_owners()
     return normalize(owners.get(normalize(team).upper())) == str(ctx.author.id)
@@ -624,6 +638,74 @@ def create_movement_request_sync(payload):
         }
     )
     return request_no
+
+
+def trade_signature(from_team, from_players, to_team, to_players):
+    sides = [
+        (normalize(from_team).upper(), sorted(normalize(name).lower() for name in from_players)),
+        (normalize(to_team).upper(), sorted(normalize(name).lower() for name in to_players)),
+    ]
+    sides.sort(key=lambda item: item[0])
+    body = "|".join(f"{team}:{','.join(players)}" for team, players in sides)
+    return hashlib.sha1(f"TRADE|{body}".encode("utf-8")).hexdigest()
+
+
+def create_trade_consent_sync(payload):
+    signature = trade_signature(
+        payload.get("fromTeam"),
+        payload.get("fromPlayers", []),
+        payload.get("toTeam"),
+        payload.get("toPlayers", []),
+    )
+    ref = db.collection("tradeConsents").document(signature)
+    snapshot = ref.get()
+    requester_team = normalize(payload.get("requesterTeam") or payload.get("fromTeam")).upper()
+
+    if not snapshot.exists:
+        ref.set(
+            {
+                "status": "WAITING",
+                "signature": signature,
+                "firstTeam": requester_team,
+                "firstPayload": payload,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        return {"ready": False, "signature": signature, "waitingFor": normalize(payload.get("toTeam")).upper()}
+
+    data = snapshot.to_dict()
+    if data.get("status") == "MATCHED":
+        return {"ready": True, "requestNo": data.get("requestNo"), "alreadyMatched": True}
+    if data.get("status") != "WAITING":
+        ref.set(
+            {
+                "status": "WAITING",
+                "signature": signature,
+                "firstTeam": requester_team,
+                "firstPayload": payload,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        return {"ready": False, "signature": signature, "waitingFor": normalize(payload.get("toTeam")).upper()}
+    if normalize(data.get("firstTeam")).upper() == requester_team:
+        return {"ready": False, "signature": signature, "waitingFor": normalize(payload.get("toTeam")).upper(), "duplicate": True}
+
+    first_payload = data.get("firstPayload") or payload
+    request_no = create_movement_request_sync(first_payload)
+    ref.set(
+        {
+            "status": "MATCHED",
+            "secondTeam": requester_team,
+            "secondPayload": payload,
+            "requestNo": request_no,
+            "matchedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    return {"ready": True, "requestNo": request_no}
 
 
 def fetch_pending_request_sync(request_no):
@@ -842,6 +924,47 @@ def movement_note(author_text, reason=""):
 async def create_movement_request(ctx, payload):
     request_no = await run_blocking(create_movement_request_sync, payload)
     embed = movement_request_embed(request_no, payload)
+    await ctx.reply(embed=embed)
+    return request_no
+
+
+async def create_trade_consent(ctx, from_team, from_players, to_team, to_players, date):
+    if not await can_request_for_team(ctx, from_team):
+        await ctx.reply(f"{from_team} 구단주 또는 관리자만 {from_team} 측 트레이드 요청을 올릴 수 있습니다.")
+        return None
+
+    payload = {
+        "kind": "TRADE",
+        "fromTeam": from_team,
+        "fromPlayers": from_players,
+        "toTeam": to_team,
+        "toPlayers": to_players,
+        "date": date,
+        "requesterTeam": from_team,
+        "requesterId": str(ctx.author.id),
+        "requesterName": str(ctx.author),
+    }
+    result = await run_blocking(create_trade_consent_sync, payload)
+
+    if result.get("alreadyMatched"):
+        await ctx.reply(f"이미 승인 대기 요청으로 올라간 트레이드입니다. 요청번호: `{result.get('requestNo')}`")
+        return result.get("requestNo")
+
+    if not result.get("ready"):
+        suffix = "이미 같은 팀 요청이 접수되어 있습니다." if result.get("duplicate") else "상대 팀 요청을 기다립니다."
+        embed = discord.Embed(title="⏳ 트레이드 양팀 확인 대기", color=0xF59E0B, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="요청 팀", value=from_team, inline=True)
+        embed.add_field(name="상대 팀", value=to_team, inline=True)
+        embed.add_field(name="선수", value=f"{', '.join(from_players)} ↔ {', '.join(to_players)}", inline=False)
+        embed.add_field(name="상태", value=suffix, inline=False)
+        embed.set_footer(text=f"상대 팀은 반대로 입력: !트레이드 {to_team} {','.join(to_players)} {from_team} {','.join(from_players)} {date}")
+        await ctx.reply(embed=embed)
+        return None
+
+    request_no = result.get("requestNo")
+    embed = movement_request_embed(request_no, payload)
+    embed.title = "⏳ 트레이드 승인 대기"
+    embed.add_field(name="양팀 확인", value="양 팀 구단주 요청이 모두 접수되었습니다.", inline=False)
     await ctx.reply(embed=embed)
     return request_no
 
@@ -1638,6 +1761,7 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
     category = normalize(category)
     role_ids = await configured_role_ids()
     special_map = {
+        "구단주": "owner",
         "은퇴": "retire",
         "임의탈퇴": "forcedRelease",
         "임의해지": "forcedRelease",
@@ -1645,6 +1769,8 @@ async def set_role_command(ctx, category: str = "", team_or_role: str = "", role
 
     if category in {"목록", "리스트"}:
         lines = [f"{team}: <@&{role_id}>" for team, role_id in sorted(role_ids["teams"].items())]
+        if role_ids.get("owner"):
+            lines.append(f"구단주: <@&{role_ids['owner']}>")
         lines.append(f"은퇴: <@&{role_ids['retire']}>")
         lines.append(f"임의탈퇴/임의해지: <@&{role_ids['forcedRelease']}>")
         await ctx.reply("현재 역할 설정입니다.\n" + "\n".join(lines))
@@ -1915,6 +2041,12 @@ async def help_command(ctx):
     )
 
     embed.add_field(
+        name="!역할 구단주 <@역할>",
+        value="구단주 전용 명령어를 사용할 Discord 역할을 설정합니다.",
+        inline=False,
+    )
+
+    embed.add_field(
         name="!역할 은퇴 <@역할> / !역할 임의탈퇴 <@역할>",
         value="은퇴, 임의탈퇴 상태 역할을 설정합니다. 현재 설정은 `!역할 목록`으로 확인합니다.",
         inline=False,
@@ -1989,7 +2121,7 @@ async def help_command(ctx):
 
     embed.add_field(
         name="!트레이드 <이전팀> <보내는선수> <새팀> <받는선수들> [날짜]",
-        value="트레이드 승인 요청을 만듭니다. 받는 선수는 쉼표로 여러 명 입력할 수 있습니다.",
+        value="양 팀이 각각 반대로 요청해야 승인 대기로 올라갑니다. 받는 선수는 쉼표로 여러 명 입력할 수 있습니다.",
         inline=False,
     )
 
@@ -2226,21 +2358,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 
     if movement_type == "트레이드":
         from_team, from_players, to_team, to_players, date = parse_trade_args(args)
-        if not await guard_trade_request(ctx, from_team, to_team):
-            return
-        await create_movement_request(
-            ctx,
-            {
-                "kind": "TRADE",
-                "fromTeam": from_team,
-                "fromPlayers": from_players,
-                "toTeam": to_team,
-                "toPlayers": to_players,
-                "date": date,
-                "requesterId": str(ctx.author.id),
-                "requesterName": str(ctx.author),
-            },
-        )
+        await create_trade_consent(ctx, from_team, from_players, to_team, to_players, date)
         return
 
     if movement_type in {"영입", "FA영입", "FA_SIGN", "FA"}:
@@ -2325,21 +2443,7 @@ async def legacy_movement(ctx, movement_type: str = "", *, args: str = ""):
 @bot.command(name="트레이드")
 async def trade(ctx, *, args: str = ""):
     from_team, from_players, to_team, to_players, date = parse_trade_args(args)
-    if not await guard_trade_request(ctx, from_team, to_team):
-        return
-    await create_movement_request(
-        ctx,
-        {
-            "kind": "TRADE",
-            "fromTeam": from_team,
-            "fromPlayers": from_players,
-            "toTeam": to_team,
-            "toPlayers": to_players,
-            "date": date,
-            "requesterId": str(ctx.author.id),
-            "requesterName": str(ctx.author),
-        },
-    )
+    await create_trade_consent(ctx, from_team, from_players, to_team, to_players, date)
 
 
 @bot.command(name="영입", aliases=["FA영입", "FA"])
