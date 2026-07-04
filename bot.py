@@ -2290,6 +2290,28 @@ async def transfer_info_command(ctx, *, player_name: str = ""):
 
     await ctx.reply(embed=transfer_info_embed(player, movements), view=TransferInfoDownloadView(player, movements))
 
+@bot.command(name="처벌채널설정")
+async def set_punishment_channel(ctx, channel_mention: str = None):
+    # 관리자 권한 확인 (기존 guard 함수 활용)
+    if not await guard(ctx):
+        return
+
+    if not channel_mention:
+        await ctx.reply("사용법: `!처벌채널설정 #채널명` 형태로 채널을 멘션해 주세요.")
+        return
+
+    # 멘션에서 채널 ID 추출
+    channel_id = parse_channel_id(channel_mention)
+    if not channel_id:
+        await ctx.reply("올바른 채널을 지정해 주세요.")
+        return
+
+    try:
+        # DB(Firestore)의 punishmentChannelId 필드에 저장
+        await set_bot_config({"punishmentChannelId": channel_id})
+        await ctx.reply(f"처벌 기록이 올라갈 채널이 <#{channel_id}>로 설정되었습니다! (일반 공지 채널과 분리됨)")
+    except Exception as e:
+        await ctx.reply(f"채널 설정 중 오류가 발생했습니다: {e}")
 
 @bot.command(name="처벌기록")
 async def punishment_record_command(ctx, *, query_text: str = ""):
