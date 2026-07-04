@@ -2730,7 +2730,7 @@ async def punishment_sheet_sync_loop():
             print(f"처벌 시트 동기화 완료: {synced}건, 로스터 제외 {removed}건")
         except Exception as exc:
             print("처벌 시트 동기화 실패:", repr(exc))
-        await asyncio.sleep(600)
+        await asyncio.sleep(60)
 
 
 def start_punishment_sheet_sync():
