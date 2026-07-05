@@ -2577,6 +2577,9 @@ async def validate_roster(ctx, *, lineup_text: str = ""):
 
     await ctx.reply(embed=embed)
 
+
+
+
 def movement_event_embed(data):
     kind = data.get("type", "이동")
     label = MOVEMENT_LABELS.get(kind, kind)
@@ -2584,11 +2587,7 @@ def movement_event_embed(data):
     to_team = data.get("toTeam", "-")
     from_players = names_from_value(data.get("fromPlayers")) or names_from_value(data.get("playerName"))
     to_players = names_from_value(data.get("toPlayers"))
-    
-    # 🔥 FA 영입일 때는 골드 색상으로 강조하고, 기본은 이전 팀 색상 유지
-    embed_color = discord.Color.gold() if kind == "FA_SIGN" else team_color(from_team)
-    
-    embed = discord.Embed(title=f"🔄 {label} 승인", color=embed_color, timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
 
     if kind == "TRADE" and to_players:
         player_lines = from_players + to_players
@@ -2607,148 +2606,12 @@ def movement_event_embed(data):
         embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
         embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
         embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
-        
-    # 🔥 [FA 계약 정보 필드 추가]
-    # Firebase에 저장한 contractYears와 contractAmount를 가져와서 포맷팅 후 디스코드 필드로 추가합니다.
-    if kind == "FA_SIGN":
-        years = data.get("contractYears", 0)
-        amount = data.get("contractAmount", 0)
-        formatted_amount = f"{amount:,}"  # 3자리 끊어 읽기 쉼표(,) 추가 (예: 50,000,000)
-        
-        embed.add_field(name="💰 계약 조건", value=f"**{years}년 / {formatted_amount} 포인트**", inline=True)
-    else:
-        # 다른 이적 구분일 경우 빈칸을 맞춰주기 위해 등록자를 inline=True로 공통 배치
-        pass
-
     embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
-    
     if data.get("note"):
         embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
-        
     embed.set_footer(text="KMBLeague System (승인됨)")
     return embed
 
-# bot.py 내의 구단 정보 조회 명령어 예시 수정
-@bot.command(name="구단정보", aliases=["구단", "팀"])
-async def club_info(ctx, *, team_name: str):
-    # 입력받은 팀 이름으로 Firestore에서 구단 문서 조회
-    team_ref = db.collection("clubs").document(team_name)
-    team_doc = team_ref.get()
-    
-    if not team_doc.exists:
-        await ctx.reply(f"❌ '{team_name}' 구단을 찾을 수 없습니다.")
-        return
-        
-    club_data = team_doc.to_dict()
-    owner = club_data.get("owner", "없음")
-    
-    # 🔥 파이어베이스에서 구단 총 연봉 값 추출 및 포맷팅
-    total_salary = club_data.get("totalSalary", 0)
-    formatted_salary = f"{total_salary:,} 포인트"
-    
-    # 해당 구단 소속 선수단 리스트 가져오기
-    players_ref = db.collection("players").where("team", "==", team_name)
-    players_docs = players_ref.stream()
-    
-    player_list = []
-    for p in players_docs:
-        p_data = p.to_dict()
-        p_name = p_data.get("name", "무명선수")
-        p_amount = p_data.get("contractAmount", 0)
-        # 선수 개인 계약금이 있으면 이름 옆에 같이 노출 (예: 홍길동(5,000,000))
-        if p_amount > 0:
-            player_list.append(f"• {p_name} ({p_amount:,}P)")
-        else:
-            player_list.append(f"• {p_name}")
-
-    players_str = "\n".join(player_list) if player_list else "등록된 선수가 없습니다."
-
-    # 메인 알림 임베드 구성
-    embed = discord.Embed(
-        title=f"🏛️ {team_name} 구단 정보 메인",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="👑 구단주 / 프런트", value=owner, inline=True)
-    # 🔥 총 연봉 필드를 메인 영역에 확실하게 추가
-    embed.add_field(name="💰 구단 총 연봉", value=f"**{formatted_salary}**", inline=True)
-    embed.add_field(name="🏃 소속 선수단 명단 (개별 계약금)", value=players_str, inline=False)
-    
-    embed.set_footer(text="KMBLeague 소속 구단 정보 현황")
-    await ctx.send(embed=embed)
-
-def get_east_asian_width(text):
-    """한글과 영문/숫자의 글자 폭이 달라서 밀리는 현상을 방지하는 정렬 헬퍼 함수"""
-    import unicodedata
-    width = 0
-    for char in text:
-        if unicodedata.east_asian_width(char) in ('F', 'W', 'A'):
-            width += 2  # 한글/이모지는 2칸
-        else:
-            width += 1  # 영문/숫자/공백은 1칸
-    return width
-
-def pad_text(text, target_width):
-    """지정한 폭에 맞게 공백을 채워 정렬해 주는 함수"""
-    text = str(text)
-    current_width = get_east_asian_width(text)
-    if current_width >= target_width:
-        return text
-    return text + " " * (target_width - current_width)
-
-@bot.command(name="구단목록", aliases=["구단", "팀목록"])
-async def show_clubs_table(ctx):
-    # 1. Firestore에서 모든 구단 데이터 가져오기
-    clubs_ref = db.collection("clubs")
-    clubs_docs = clubs_ref.stream()
-    
-    club_list = []
-    for doc in clubs_docs:
-        data = doc.to_dict()
-        club_list.append({
-            "name": data.get("name", "-"),
-            "owner": data.get("owner", "-"),
-            "director": data.get("director", data.get("manager", "-")), # 감독/매니저 호환
-            "coach": data.get("coach", "-"),
-            "salary": data.get("totalSalary", 0)
-        })
-    
-    if not club_list:
-        await ctx.reply("📁 현재 등록된 구단 정보가 없습니다.")
-        return
-
-    # 2. 스크린샷과 동일한 상단 표 헤더 구성 (각 컬럼별 고정 너비 설정)
-    # [ 구단 ] [ 구단주 ] [ 감독 ] [ 코치 ] [ 총 연봉 ]
-    header = f"{pad_text('[ 구단 ]', 14)} {pad_text('[ 구단주 ]', 14)} {pad_text('[ 감독 ]', 14)} {pad_text('[ 코치 ]', 14)} {pad_text('[ 총 연봉 ]', 16)}"
-    divider = "─" * len(header)
-    
-    table_lines = []
-    table_lines.append(header)
-    table_lines.append(divider)
-    
-    # 3. 각 구단별 데이터를 정렬 규칙에 맞춰 세 줄/네 줄로 누적
-    for c in club_list:
-        formatted_salary = f"{c['salary']:,}P" # 천 단위 쉼표 및 포인트 표기
-        
-        line = (
-            f"{pad_text(c['name'], 14)} "
-            f"{pad_text(c['owner'], 14)} "
-            f"{pad_text(c['director'], 14)} "
-            f"{pad_text(c['coach'], 14)} "
-            f"{pad_text(formatted_salary, 16)}"
-        )
-        table_lines.append(line)
-        
-    # 4. 디스코드 코드 블록 (```) 효과를 주어 고정폭 폰트로 출력 (스크린샷 형태 구현)
-    content = "\n".join(table_lines)
-    
-    embed = discord.Embed(
-        title="🏛️ KMBLeague 구단별 프런트 및 연봉 현황 메인",
-        color=discord.Color.dark_theme(),
-        description=f"```\n{content}\n```"
-    )
-    embed.set_footer(text=f"총 {len(club_list)}개 구단 작동 중 • KMB System")
-    
-    await ctx.send(embed=embed)
 
 def player_event_embed(data):
     team = data.get("team", "팀 미정")
