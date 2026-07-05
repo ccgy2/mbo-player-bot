@@ -2577,9 +2577,6 @@ async def validate_roster(ctx, *, lineup_text: str = ""):
 
     await ctx.reply(embed=embed)
 
-
-
-
 def movement_event_embed(data):
     kind = data.get("type", "이동")
     label = MOVEMENT_LABELS.get(kind, kind)
@@ -2587,7 +2584,11 @@ def movement_event_embed(data):
     to_team = data.get("toTeam", "-")
     from_players = names_from_value(data.get("fromPlayers")) or names_from_value(data.get("playerName"))
     to_players = names_from_value(data.get("toPlayers"))
-    embed = discord.Embed(title=f"🔄 {label} 승인", color=team_color(from_team), timestamp=datetime.now(timezone.utc))
+    
+    # 🔥 FA 영입일 때는 골드 색상으로 강조하고, 기본은 이전 팀 색상 유지
+    embed_color = discord.Color.gold() if kind == "FA_SIGN" else team_color(from_team)
+    
+    embed = discord.Embed(title=f"🔄 {label} 승인", color=embed_color, timestamp=datetime.now(timezone.utc))
 
     if kind == "TRADE" and to_players:
         player_lines = from_players + to_players
@@ -2606,12 +2607,26 @@ def movement_event_embed(data):
         embed.add_field(name="선수", value="\n".join(player_lines) or "-", inline=True)
         embed.add_field(name="이전소속", value="\n".join(from_lines) or "-", inline=True)
         embed.add_field(name="신규 소속", value="\n".join(to_lines) or "-", inline=True)
+        
+    # 🔥 [FA 계약 정보 필드 추가]
+    # Firebase에 저장한 contractYears와 contractAmount를 가져와서 포맷팅 후 디스코드 필드로 추가합니다.
+    if kind == "FA_SIGN":
+        years = data.get("contractYears", 0)
+        amount = data.get("contractAmount", 0)
+        formatted_amount = f"{amount:,}"  # 3자리 끊어 읽기 쉼표(,) 추가 (예: 50,000,000)
+        
+        embed.add_field(name="💰 계약 조건", value=f"**{years}년 / {formatted_amount} 포인트**", inline=True)
+    else:
+        # 다른 이적 구분일 경우 빈칸을 맞춰주기 위해 등록자를 inline=True로 공통 배치
+        pass
+
     embed.add_field(name="등록자", value=data.get("createdByName", "웹/알 수 없음"), inline=True)
+    
     if data.get("note"):
         embed.add_field(name="메모", value=str(data.get("note"))[:1024], inline=False)
+        
     embed.set_footer(text="KMBLeague System (승인됨)")
     return embed
-
 
 def player_event_embed(data):
     team = data.get("team", "팀 미정")
