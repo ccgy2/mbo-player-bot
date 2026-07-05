@@ -2628,6 +2628,54 @@ def movement_event_embed(data):
     embed.set_footer(text="KMBLeague System (승인됨)")
     return embed
 
+# bot.py 내의 구단 정보 조회 명령어 예시 수정
+@bot.command(name="구단정보", aliases=["구단", "팀"])
+async def club_info(ctx, *, team_name: str):
+    # 입력받은 팀 이름으로 Firestore에서 구단 문서 조회
+    team_ref = db.collection("clubs").document(team_name)
+    team_doc = team_ref.get()
+    
+    if not team_doc.exists:
+        await ctx.reply(f"❌ '{team_name}' 구단을 찾을 수 없습니다.")
+        return
+        
+    club_data = team_doc.to_dict()
+    owner = club_data.get("owner", "없음")
+    
+    # 🔥 파이어베이스에서 구단 총 연봉 값 추출 및 포맷팅
+    total_salary = club_data.get("totalSalary", 0)
+    formatted_salary = f"{total_salary:,} 포인트"
+    
+    # 해당 구단 소속 선수단 리스트 가져오기
+    players_ref = db.collection("players").where("team", "==", team_name)
+    players_docs = players_ref.stream()
+    
+    player_list = []
+    for p in players_docs:
+        p_data = p.to_dict()
+        p_name = p_data.get("name", "무명선수")
+        p_amount = p_data.get("contractAmount", 0)
+        # 선수 개인 계약금이 있으면 이름 옆에 같이 노출 (예: 홍길동(5,000,000))
+        if p_amount > 0:
+            player_list.append(f"• {p_name} ({p_amount:,}P)")
+        else:
+            player_list.append(f"• {p_name}")
+
+    players_str = "\n".join(player_list) if player_list else "등록된 선수가 없습니다."
+
+    # 메인 알림 임베드 구성
+    embed = discord.Embed(
+        title=f"🏛️ {team_name} 구단 정보 메인",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="👑 구단주 / 프런트", value=owner, inline=True)
+    # 🔥 총 연봉 필드를 메인 영역에 확실하게 추가
+    embed.add_field(name="💰 구단 총 연봉", value=f"**{formatted_salary}**", inline=True)
+    embed.add_field(name="🏃 소속 선수단 명단 (개별 계약금)", value=players_str, inline=False)
+    
+    embed.set_footer(text="KMBLeague 소속 구단 정보 현황")
+    await ctx.send(embed=embed)
+
 def player_event_embed(data):
     team = data.get("team", "팀 미정")
     embed = discord.Embed(title="로스터 등록", color=team_color(team), timestamp=datetime.now(timezone.utc))
