@@ -2577,8 +2577,79 @@ async def validate_roster(ctx, *, lineup_text: str = ""):
 
     await ctx.reply(embed=embed)
 
+def get_east_asian_width(text):
+    """한글과 영문/숫자의 글자 폭이 달라서 밀리는 현상을 방지하는 정렬 헬퍼 함수"""
+    import unicodedata
+    width = 0
+    for char in text:
+        if unicodedata.east_asian_width(char) in ('F', 'W', 'A'):
+            width += 2  # 한글/이모지는 2칸
+        else:
+            width += 1  # 영문/숫자/공백은 1칸
+    return width
 
+def pad_text(text, target_width):
+    """지정한 폭에 맞게 공백을 채워 정렬해 주는 함수"""
+    text = str(text)
+    current_width = get_east_asian_width(text)
+    if current_width >= target_width:
+        return text
+    return text + " " * (target_width - current_width)
 
+@bot.command(name="구단목록", aliases=["구단", "팀목록"])
+async def show_clubs_table(ctx):
+    # 1. Firestore에서 모든 구단 데이터 가져오기
+    clubs_ref = db.collection("clubs")
+    clubs_docs = clubs_ref.stream()
+    
+    club_list = []
+    for doc in clubs_docs:
+        data = doc.to_dict()
+        club_list.append({
+            "name": data.get("name", "-"),
+            "owner": data.get("owner", "-"),
+            "director": data.get("director", data.get("manager", "-")), # 감독/매니저 호환
+            "coach": data.get("coach", "-"),
+            "salary": data.get("totalSalary", 0)
+        })
+    
+    if not club_list:
+        await ctx.reply("📁 현재 등록된 구단 정보가 없습니다.")
+        return
+
+    # 2. 스크린샷과 동일한 상단 표 헤더 구성 (각 컬럼별 고정 너비 설정)
+    # [ 구단 ] [ 구단주 ] [ 감독 ] [ 코치 ] [ 총 연봉 ]
+    header = f"{pad_text('[ 구단 ]', 14)} {pad_text('[ 구단주 ]', 14)} {pad_text('[ 감독 ]', 14)} {pad_text('[ 코치 ]', 14)} {pad_text('[ 총 연봉 ]', 16)}"
+    divider = "─" * len(header)
+    
+    table_lines = []
+    table_lines.append(header)
+    table_lines.append(divider)
+    
+    # 3. 각 구단별 데이터를 정렬 규칙에 맞춰 세 줄/네 줄로 누적
+    for c in club_list:
+        formatted_salary = f"{c['salary']:,}P" # 천 단위 쉼표 및 포인트 표기
+        
+        line = (
+            f"{pad_text(c['name'], 14)} "
+            f"{pad_text(c['owner'], 14)} "
+            f"{pad_text(c['director'], 14)} "
+            f"{pad_text(c['coach'], 14)} "
+            f"{pad_text(formatted_salary, 16)}"
+        )
+        table_lines.append(line)
+        
+    # 4. 디스코드 코드 블록 (```) 효과를 주어 고정폭 폰트로 출력 (스크린샷 형태 구현)
+    content = "\n".join(table_lines)
+    
+    embed = discord.Embed(
+        title="🏛️ KMBLeague 구단별 프런트 및 연봉 현황 메인",
+        color=discord.Color.dark_theme(),
+        description=f"```\n{content}\n```"
+    )
+    embed.set_footer(text=f"총 {len(club_list)}개 구단 작동 중 • KMB System")
+    
+    await ctx.send(embed=embed)
 
 def movement_event_embed(data):
     kind = data.get("type", "이동")
