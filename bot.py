@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import asyncio
 import csv
 import hashlib
@@ -396,10 +397,11 @@ def team_meta_sync():
         docs = db.collection("clubs").stream()
         for doc_snapshot in docs:
             data = doc_snapshot.to_dict()
-            name = normalize(data.get("name"))
+            code = normalize(data.get("code") or data.get("name")).upper()
+            name = normalize(data.get("displayName") or data.get("fullName") or data.get("name") or code)
             color = parse_hex_color(data.get("color"))
-            if name and color is not None:
-                meta[name.upper()] = {"name": name, "color": color}
+            if code and color is not None:
+                meta[code] = {"name": name, "color": color, "logoUrl": normalize(data.get("logoUrl"))}
     except Exception as exc:
         print("팀 목록 조회 실패:", repr(exc))
     return meta
@@ -2123,6 +2125,7 @@ async def help_command(ctx):
 
     embed = discord.Embed(title="KMB Python 봇 명령어", color=0x0F766E)
 
+    embed.add_field(name="!구단설정", value="`!구단설정 <팀코드> \"<정식 팀명>\" <#헥사> <창단일|-> <구단주|-> <로고URL|->` · 같은 팀 코드는 기존 정보 수정", inline=False)
     embed.add_field(name="!리그일정", value="`!리그일정 <홈팀> <어웨이팀> <경기장> <홈선발> <어웨이선발> <YYYY-MM-DD> <HH:MM>`", inline=False)
     embed.add_field(name="!리그결과", value="`!리그결과 <홈팀> <어웨이팀> <홈점수> <어웨이점수> <승리투수> <패전투수> [홀드] [세이브] <YYYY-MM-DD> <HH:MM>`", inline=False)
 
@@ -2689,6 +2692,62 @@ def pad_text(text, target_width):
         return text
     return text + " " * (target_width - current_width)
 
+@bot.command(name="구단설정", aliases=["팀설정"])
+async def configure_club_command(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        await ctx.reply("따옴표가 올바르게 닫혔는지 확인해주세요.")
+        return
+    if len(parts) != 6:
+        await ctx.reply(
+            "사용법: `!구단설정 <팀코드> \"<정식 팀명>\" <#헥사코드> <YYYY-MM-DD|-> <구단주|-> <로고URL|->`\n"
+            "예: `!구단설정 PBG \"퍼펙트 베이스볼 가디언즈\" #1D4ED8 2026-08-31 PlayerName https://example.com/pbg.png`"
+        )
+        return
+    code, display_name, color_text, founded_date, owner, logo_url = parts
+    code = normalize(code).upper()
+    color = parse_hex_color(color_text)
+    color_hex = f"#{color:06X}" if color is not None else ""
+    founded_date = "" if founded_date == "-" else founded_date
+    owner = "" if owner == "-" else owner
+    logo_url = "" if logo_url == "-" else logo_url
+    if not re.fullmatch(r"[A-Z0-9_-]{2,12}", code):
+        await ctx.reply("팀 코드는 영문 대문자·숫자·`_`·`-` 조합 2~12자로 입력해주세요."); return
+    if not display_name or color is None:
+        await ctx.reply("정식 팀명과 `#RRGGBB` 형식의 헥사코드를 확인해주세요."); return
+    if founded_date and not is_date(founded_date):
+        await ctx.reply("창단일은 `YYYY-MM-DD` 형식 또는 `-`로 입력해주세요."); return
+    if logo_url and not re.match(r"^https?://", logo_url, re.I):
+        await ctx.reply("팀 로고는 `http://` 또는 `https://` URL이나 `-`로 입력해주세요."); return
+
+    payload = {
+        "name": code, "code": code, "displayName": display_name, "color": color_hex,
+        "foundedDate": founded_date, "owner": owner, "logoUrl": logo_url,
+        "updatedBy": str(ctx.author.id), "updatedByName": str(ctx.author),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    def save_club():
+        existing = next((item for item in db.collection("clubs").stream() if normalize(item.to_dict().get("code") or item.to_dict().get("name")).upper() == code), None)
+        if existing:
+            existing.reference.set(payload, merge=True)
+            return existing.id, True
+        payload["createdAt"] = firestore.SERVER_TIMESTAMP
+        return db.collection("clubs").add(payload)[1].id, False
+
+    club_id, updated = await asyncio.to_thread(save_club)
+    embed = discord.Embed(title=f"{'구단 정보 수정' if updated else '구단 등록'} · {code}", description=display_name, color=color)
+    embed.add_field(name="팀 색상", value=color_hex, inline=True)
+    embed.add_field(name="창단일", value=founded_date or "-", inline=True)
+    embed.add_field(name="구단주", value=owner or "-", inline=True)
+    if logo_url: embed.set_thumbnail(url=logo_url)
+    embed.set_footer(text=f"웹과 연동됨 · ID {club_id}")
+    await ctx.reply(embed=embed)
+
+
 @bot.command(name="구단목록", aliases=["구단", "팀목록"])
 async def show_clubs_table(ctx):
     # 1. Firestore에서 모든 구단 데이터 가져오기
@@ -2699,7 +2758,7 @@ async def show_clubs_table(ctx):
     for doc in clubs_docs:
         data = doc.to_dict()
         club_list.append({
-            "name": data.get("name", "-"),
+            "name": data.get("displayName", data.get("name", "-")),
             "owner": data.get("owner", "-"),
             "director": data.get("director", data.get("manager", "-")), # 감독/매니저 호환
             "coach": data.get("coach", "-"),
