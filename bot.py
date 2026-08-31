@@ -2692,6 +2692,70 @@ def pad_text(text, target_width):
         return text
     return text + " " * (target_width - current_width)
 
+def find_club_by_code_sync(code):
+    target = normalize(code).upper()
+    return next((item for item in db.collection("clubs").stream() if normalize(item.to_dict().get("code") or item.to_dict().get("name")).upper() == target), None)
+
+
+@bot.command(name="팀등록")
+async def simple_team_create_command(ctx, code: str = "", *, display_name: str = ""):
+    if not await guard(ctx): return
+    code = normalize(code).upper(); display_name = normalize(display_name)
+    if not re.fullmatch(r"[A-Z0-9_-]{2,12}", code) or not display_name:
+        await ctx.reply("사용법: `!팀등록 <팀코드> <팀명>`\n예: `!팀등록 PBG 퍼펙트 베이스볼 가디언즈`"); return
+    def create_team():
+        existing = find_club_by_code_sync(code)
+        if existing: return existing.id, True
+        payload = {"name": code, "code": code, "displayName": display_name, "color": "#64748B", "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+        return db.collection("clubs").add(payload)[1].id, False
+    club_id, existed = await asyncio.to_thread(create_team)
+    if existed:
+        await ctx.reply(f"{code} 팀은 이미 있습니다. `!팀수정 {code} 이름 {display_name}`으로 수정해주세요."); return
+    await ctx.reply(f"✅ **{display_name} ({code})** 팀을 등록했습니다.\n색상 예: `!팀수정 {code} 색상 #1D4ED8`\n로고 예: `!팀수정 {code} 로고 img/{code}.png`")
+
+
+@bot.command(name="팀수정")
+async def simple_team_update_command(ctx, code: str = "", field: str = "", *, value: str = ""):
+    if not await guard(ctx): return
+    code, field, value = normalize(code).upper(), normalize(field), normalize(value)
+    field_map = {"이름": "displayName", "팀명": "displayName", "색상": "color", "컬러": "color", "창단일": "foundedDate", "구단주": "owner", "로고": "logoUrl"}
+    key = field_map.get(field)
+    if not code or not key or not value:
+        await ctx.reply("사용법: `!팀수정 <팀코드> <이름|색상|창단일|구단주|로고> <값>`\n예: `!팀수정 PBG 색상 #1D4ED8`"); return
+    if key == "color" and parse_hex_color(value) is None:
+        await ctx.reply("색상은 `#RRGGBB` 형식으로 입력해주세요."); return
+    if key == "foundedDate" and value != "-" and not is_date(value):
+        await ctx.reply("창단일은 `YYYY-MM-DD` 형식으로 입력해주세요."); return
+    if value == "-": value = ""
+    def update_team():
+        existing = find_club_by_code_sync(code)
+        if not existing: return False
+        existing.reference.set({key: value.upper() if key == "color" else value, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        return True
+    if not await asyncio.to_thread(update_team):
+        await ctx.reply(f"{code} 팀을 찾지 못했습니다. 먼저 `!팀등록 {code} 팀명`을 사용해주세요."); return
+    await ctx.reply(f"✅ **{code}** 팀의 **{field}**을(를) `{value or '비움'}`으로 변경했습니다.")
+
+
+@bot.command(name="팀명령어", aliases=["팀도움말"])
+async def team_command_help(ctx):
+    embed = discord.Embed(title="팀 관리 쉬운 명령어", color=0x0F766E, description="복사한 뒤 팀 코드와 값만 바꾸세요.")
+    embed.add_field(name="1. 팀 등록", value="`!팀등록 PBG 퍼펙트 베이스볼 가디언즈`", inline=False)
+    embed.add_field(name="2. 정보 수정", value="`!팀수정 PBG 이름 퍼펙트 베이스볼 가디언즈`\n`!팀수정 PBG 색상 #1D4ED8`\n`!팀수정 PBG 창단일 2026-08-31`\n`!팀수정 PBG 구단주 HaeSol`\n`!팀수정 PBG 로고 img/PBG.png`", inline=False)
+    embed.add_field(name="전체 고급 설정", value="필요할 때만 `!구단설정`을 사용하세요.", inline=False)
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="팀확인")
+async def team_check_command(ctx, code: str = ""):
+    code = normalize(code).upper()
+    meta = await asyncio.to_thread(team_meta_sync)
+    team = meta.get(code)
+    if not team:
+        await ctx.reply(f"❌ `{code}` 팀을 현재 봇이 찾지 못했습니다. `!팀등록 {code} 팀명`으로 등록해주세요."); return
+    await ctx.reply(f"✅ `{code}` 팀 인식 정상 · **{team.get('name', code)}** · 색상 `#{team.get('color', 0x64748B):06X}`")
+
+
 @bot.command(name="구단설정", aliases=["팀설정"])
 async def configure_club_command(ctx, *, args: str = ""):
     if not await guard(ctx):
@@ -2731,7 +2795,7 @@ async def configure_club_command(ctx, *, args: str = ""):
     }
 
     def save_club():
-        existing = next((item for item in db.collection("clubs").stream() if normalize(item.to_dict().get("code") or item.to_dict().get("name")).upper() == code), None)
+        existing = find_club_by_code_sync(code)
         if existing:
             existing.reference.set(payload, merge=True)
             return existing.id, True
