@@ -282,9 +282,9 @@ async def sync_member_roles_for_movement(data):
 
             try:
                 if remove_roles:
-                    await member.remove_roles(*remove_roles, reason="MBO 선수 이동 역할 동기화")
+                    await member.remove_roles(*remove_roles, reason="KMB 선수 이동 역할 동기화")
                 if add_role and add_role not in member.roles:
-                    await member.add_roles(add_role, reason="MBO 선수 이동 역할 동기화")
+                    await member.add_roles(add_role, reason="KMB 선수 이동 역할 동기화")
                 results.append(f"{guild.name} / {player_name}: {target_label}")
             except discord.Forbidden:
                 results.append(f"{guild.name} / {player_name}: 권한 부족")
@@ -2031,7 +2031,7 @@ async def help_command(ctx):
     if not await guard(ctx):
         return
 
-    embed = discord.Embed(title="MBO Python 봇 명령어", color=0x0F766E)
+    embed = discord.Embed(title="KMB Python 봇 명령어", color=0x0F766E)
 
     embed.add_field(
         name="!채널 설정 <#채널>",
@@ -2201,7 +2201,7 @@ async def help_command(ctx):
         pages = []
         for index in range(0, len(fields), 25):
             page = discord.Embed(
-                title="MBO Python 봇 명령어" if index == 0 else "MBO Python 봇 명령어 계속",
+                title="KMB Python 봇 명령어" if index == 0 else "KMB Python 봇 명령어 계속",
                 color=0x0F766E,
             )
             for field in fields[index : index + 25]:
@@ -2840,7 +2840,7 @@ async def on_command_error(ctx, error):
 async def on_ready():
     start_firestore_watchers()
     start_punishment_sheet_sync()
-    print(f"MBO Python 봇 준비됨: {bot.user}")
+    print(f"KMB Python 봇 준비됨: {bot.user}")
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
