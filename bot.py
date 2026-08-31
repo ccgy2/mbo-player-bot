@@ -38,6 +38,7 @@ DEFAULT_ROLE_IDS = {
 
 FREE_AGENT_TEAM = "무소속"
 DEFAULT_TEAM_META = {
+    "PBG": {"name": "PBG", "color": 0x1D4ED8},
     FREE_AGENT_TEAM: {"name": FREE_AGENT_TEAM, "color": 0x64748B},
 }
 
@@ -355,6 +356,15 @@ def today():
 
 def is_date(value):
     return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalize(value)))
+
+
+def normalize_game_datetime(date_text, time_text):
+    value = f"{normalize(date_text)} {normalize(time_text)}"
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    except ValueError as exc:
+        raise ValueError("경기 일시는 `YYYY-MM-DD HH:MM` 형식으로 입력해주세요.") from exc
+    return parsed.strftime("%Y-%m-%dT%H:%M")
 
 
 def parse_names(value):
@@ -2026,12 +2036,95 @@ async def deny_request_command(ctx, admin_text: str = "", request_no: str = ""):
     await ctx.reply(embed=embed)
 
 
+@bot.command(name="리그일정")
+async def league_schedule_command(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+    parts = args.split()
+    if len(parts) != 7:
+        await ctx.reply("사용법: `!리그일정 <홈팀> <어웨이팀> <경기장> <홈선발투수> <어웨이선발투수> <YYYY-MM-DD> <HH:MM>`")
+        return
+    home_team, away_team, stadium, home_starter, away_starter, date_text, time_text = parts
+    home_team, away_team = home_team.upper(), away_team.upper()
+    if not valid_team_sync(home_team) or not valid_team_sync(away_team):
+        await ctx.reply("등록된 팀 코드를 확인해주세요.")
+        return
+    try:
+        game_datetime = normalize_game_datetime(date_text, time_text)
+    except ValueError as exc:
+        await ctx.reply(str(exc)); return
+    payload = {
+        "homeTeam": home_team, "awayTeam": away_team, "stadium": stadium,
+        "homeStarter": home_starter, "awayStarter": away_starter,
+        "gameDateTime": game_datetime, "status": "SCHEDULED",
+        "createdBy": str(ctx.author.id), "createdByName": str(ctx.author),
+        "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    reference = await asyncio.to_thread(lambda: db.collection("leagueGames").add(payload))
+    embed = discord.Embed(title="⚾ 리그 일정 등록", color=team_color(home_team))
+    embed.add_field(name="대진", value=f"{away_team} VS {home_team}", inline=False)
+    embed.add_field(name="경기장", value=stadium, inline=True)
+    embed.add_field(name="경기 일시", value=game_datetime.replace("T", " "), inline=True)
+    embed.add_field(name="선발투수", value=f"{away_team} {away_starter} / {home_team} {home_starter}", inline=False)
+    embed.set_footer(text=f"웹과 연동됨 · ID {reference[1].id}")
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="리그결과")
+async def league_result_command(ctx, *, args: str = ""):
+    if not await guard(ctx):
+        return
+    parts = args.split()
+    if len(parts) not in {8, 9, 10}:
+        await ctx.reply("사용법: `!리그결과 <홈팀> <어웨이팀> <홈점수> <어웨이점수> <승리투수> <패전투수> [홀드투수] [세이브투수] <YYYY-MM-DD> <HH:MM>`\n홀드 없이 세이브만 입력할 때는 홀드 자리에 `-`를 입력하세요.")
+        return
+    home_team, away_team = parts[0].upper(), parts[1].upper()
+    if not valid_team_sync(home_team) or not valid_team_sync(away_team):
+        await ctx.reply("등록된 팀 코드를 확인해주세요."); return
+    try:
+        home_score, away_score = int(parts[2]), int(parts[3])
+        if home_score < 0 or away_score < 0: raise ValueError
+        game_datetime = normalize_game_datetime(parts[-2], parts[-1])
+    except ValueError:
+        await ctx.reply("점수는 0 이상의 숫자, 경기 일시는 `YYYY-MM-DD HH:MM` 형식으로 입력해주세요."); return
+    optional = parts[6:-2]
+    hold_pitcher = optional[0] if len(optional) >= 1 and optional[0] != "-" else ""
+    save_pitcher = optional[1] if len(optional) >= 2 and optional[1] != "-" else ""
+    payload = {
+        "homeTeam": home_team, "awayTeam": away_team, "homeScore": home_score, "awayScore": away_score,
+        "winningPitcher": parts[4], "losingPitcher": parts[5], "holdPitcher": hold_pitcher,
+        "savePitcher": save_pitcher, "gameDateTime": game_datetime, "status": "COMPLETED",
+        "updatedBy": str(ctx.author.id), "updatedByName": str(ctx.author), "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    def save_result():
+        matches = [
+            item for item in db.collection("leagueGames").where("homeTeam", "==", home_team).stream()
+            if normalize(item.to_dict().get("awayTeam")).upper() == away_team
+            and normalize(item.to_dict().get("gameDateTime")) == game_datetime
+        ][:1]
+        if matches:
+            matches[0].reference.set(payload, merge=True); return matches[0].id
+        payload["createdAt"] = firestore.SERVER_TIMESTAMP
+        return db.collection("leagueGames").add(payload)[1].id
+    game_id = await asyncio.to_thread(save_result)
+    embed = discord.Embed(title="🏁 경기 결과 등록", color=team_color(home_team))
+    embed.add_field(name="최종 스코어", value=f"{away_team} {away_score} : {home_score} {home_team}", inline=False)
+    embed.add_field(name="승/패", value=f"승 {parts[4]} / 패 {parts[5]}", inline=False)
+    if hold_pitcher: embed.add_field(name="홀드", value=hold_pitcher, inline=True)
+    if save_pitcher: embed.add_field(name="세이브", value=save_pitcher, inline=True)
+    embed.set_footer(text=f"웹과 연동됨 · {game_datetime.replace('T', ' ')} · ID {game_id}")
+    await ctx.reply(embed=embed)
+
+
 @bot.command(name="도움말")
 async def help_command(ctx):
     if not await guard(ctx):
         return
 
     embed = discord.Embed(title="KMB Python 봇 명령어", color=0x0F766E)
+
+    embed.add_field(name="!리그일정", value="`!리그일정 <홈팀> <어웨이팀> <경기장> <홈선발> <어웨이선발> <YYYY-MM-DD> <HH:MM>`", inline=False)
+    embed.add_field(name="!리그결과", value="`!리그결과 <홈팀> <어웨이팀> <홈점수> <어웨이점수> <승리투수> <패전투수> [홀드] [세이브] <YYYY-MM-DD> <HH:MM>`", inline=False)
 
     embed.add_field(
         name="!채널 설정 <#채널>",
