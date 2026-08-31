@@ -15,6 +15,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
+from aiohttp import web
 
 
 load_dotenv()
@@ -27,6 +28,10 @@ CONFIG_REF = None
 SNAPSHOT_UNSUBSCRIBES = []
 SNAPSHOTS_STARTED = False
 PUNISHMENT_SYNC_STARTED = False
+MINECRAFT_WEBHOOK_STARTED = False
+MINECRAFT_WEB_RUNNER = None
+MINECRAFT_WEBHOOK_SECRET = os.getenv("MINECRAFT_WEBHOOK_SECRET", "")
+MINECRAFT_WEBHOOK_PORT = int(os.getenv("PORT", os.getenv("MINECRAFT_WEBHOOK_PORT", "8080")))
 PUNISHMENT_SHEET_ID = "1kf6UP4zCvL6drY4GN9CIhwM97f10aIGrlpRzYESuqgU"
 PUNISHMENT_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{PUNISHMENT_SHEET_ID}/export?format=csv"
 
@@ -3028,6 +3033,115 @@ def start_punishment_sheet_sync():
     bot.loop.create_task(punishment_sheet_sync_loop())
 
 
+def webhook_value(payload, *keys, default=""):
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and normalize(value) != "":
+            return normalize(value)
+    return default
+
+
+def require_minecraft_webhook(request):
+    supplied = normalize(request.headers.get("X-KMB-Key"))
+    authorization = normalize(request.headers.get("Authorization"))
+    if authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    return bool(MINECRAFT_WEBHOOK_SECRET) and hashlib.compare_digest(supplied, MINECRAFT_WEBHOOK_SECRET)
+
+
+async def minecraft_payload(request):
+    if request.content_type == "application/json":
+        return await request.json()
+    return dict(await request.post())
+
+
+async def minecraft_health(request):
+    return web.json_response({"ok": True, "service": "KMB Minecraft league webhook", "botReady": bot.is_ready()})
+
+
+async def minecraft_league_schedule(request):
+    if not require_minecraft_webhook(request):
+        raise web.HTTPUnauthorized(text="invalid webhook key")
+    payload = await minecraft_payload(request)
+    home_team = webhook_value(payload, "homeTeam", "home", "홈팀").upper()
+    away_team = webhook_value(payload, "awayTeam", "away", "어웨이팀").upper()
+    game_datetime = webhook_value(payload, "gameDateTime", "datetime", "경기일시").replace(" ", "T")
+    if not valid_team_sync(home_team) or not valid_team_sync(away_team):
+        return web.json_response({"ok": False, "error": "등록된 팀 코드를 확인해주세요."}, status=400)
+    try:
+        datetime.strptime(game_datetime, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return web.json_response({"ok": False, "error": "gameDateTime은 YYYY-MM-DD HH:MM 형식입니다."}, status=400)
+    record = {
+        "homeTeam": home_team, "awayTeam": away_team,
+        "stadium": webhook_value(payload, "stadium", "경기장", default="마인크래프트 구장"),
+        "homeStarter": webhook_value(payload, "homeStarter", "홈선발", default="미정"),
+        "awayStarter": webhook_value(payload, "awayStarter", "어웨이선발", default="미정"),
+        "gameDateTime": game_datetime, "status": "SCHEDULED", "source": "minecraft",
+        "createdBy": "minecraft-webhook", "createdByName": webhook_value(payload, "server", "서버", default="Minecraft"),
+        "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    created = await asyncio.to_thread(lambda: db.collection("leagueGames").add(record)[1].id)
+    return web.json_response({"ok": True, "id": created, "message": "리그 일정이 기록되었습니다."})
+
+
+async def minecraft_league_result(request):
+    if not require_minecraft_webhook(request):
+        raise web.HTTPUnauthorized(text="invalid webhook key")
+    payload = await minecraft_payload(request)
+    home_team = webhook_value(payload, "homeTeam", "home", "홈팀").upper()
+    away_team = webhook_value(payload, "awayTeam", "away", "어웨이팀").upper()
+    game_datetime = webhook_value(payload, "gameDateTime", "datetime", "경기일시").replace(" ", "T")
+    if not valid_team_sync(home_team) or not valid_team_sync(away_team):
+        return web.json_response({"ok": False, "error": "등록된 팀 코드를 확인해주세요."}, status=400)
+    try:
+        home_score = int(webhook_value(payload, "homeScore", "홈점수"))
+        away_score = int(webhook_value(payload, "awayScore", "어웨이점수"))
+        datetime.strptime(game_datetime, "%Y-%m-%dT%H:%M")
+        if home_score < 0 or away_score < 0: raise ValueError
+    except ValueError:
+        return web.json_response({"ok": False, "error": "점수와 경기 일시 형식을 확인해주세요."}, status=400)
+    record = {
+        "homeTeam": home_team, "awayTeam": away_team, "homeScore": home_score, "awayScore": away_score,
+        "winningPitcher": webhook_value(payload, "winningPitcher", "승리투수", default="미정"),
+        "losingPitcher": webhook_value(payload, "losingPitcher", "패전투수", default="미정"),
+        "holdPitcher": webhook_value(payload, "holdPitcher", "홀드투수"),
+        "savePitcher": webhook_value(payload, "savePitcher", "세이브투수"),
+        "gameDateTime": game_datetime, "status": "COMPLETED", "source": "minecraft",
+        "updatedBy": "minecraft-webhook", "updatedByName": webhook_value(payload, "server", "서버", default="Minecraft"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    def save_result():
+        match = next((item for item in db.collection("leagueGames").where("homeTeam", "==", home_team).stream() if normalize(item.to_dict().get("awayTeam")).upper() == away_team and normalize(item.to_dict().get("gameDateTime")) == game_datetime), None)
+        if match:
+            match.reference.set(record, merge=True); return match.id, True
+        record["createdAt"] = firestore.SERVER_TIMESTAMP
+        return db.collection("leagueGames").add(record)[1].id, False
+    game_id, updated = await asyncio.to_thread(save_result)
+    channel = await resolve_channel(await configured_public_channel_id())
+    if channel:
+        embed = discord.Embed(title="⛏️ Minecraft 경기 결과", color=team_color(home_team))
+        embed.add_field(name="최종 스코어", value=f"{away_team} {away_score} : {home_score} {home_team}", inline=False)
+        embed.add_field(name="경기 일시", value=game_datetime.replace("T", " "), inline=True)
+        await channel.send(embed=embed)
+    return web.json_response({"ok": True, "id": game_id, "updated": updated, "message": "경기 결과가 기록되었습니다."})
+
+
+async def start_minecraft_webhook():
+    global MINECRAFT_WEBHOOK_STARTED, MINECRAFT_WEB_RUNNER
+    if MINECRAFT_WEBHOOK_STARTED or not MINECRAFT_WEBHOOK_SECRET:
+        if not MINECRAFT_WEBHOOK_SECRET:
+            print("Minecraft 웹훅 비활성: MINECRAFT_WEBHOOK_SECRET 환경변수가 없습니다.")
+        return
+    app = web.Application(client_max_size=1024 * 1024)
+    app.add_routes([web.get("/health", minecraft_health), web.post("/minecraft/league/schedule", minecraft_league_schedule), web.post("/minecraft/league/result", minecraft_league_result)])
+    MINECRAFT_WEB_RUNNER = web.AppRunner(app)
+    await MINECRAFT_WEB_RUNNER.setup()
+    await web.TCPSite(MINECRAFT_WEB_RUNNER, "0.0.0.0", MINECRAFT_WEBHOOK_PORT).start()
+    MINECRAFT_WEBHOOK_STARTED = True
+    print(f"Minecraft 웹훅 준비됨: port {MINECRAFT_WEBHOOK_PORT}")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     original = getattr(error, "original", error)
@@ -3056,6 +3170,7 @@ async def on_command_error(ctx, error):
 async def on_ready():
     start_firestore_watchers()
     start_punishment_sheet_sync()
+    await start_minecraft_webhook()
     print(f"KMB Python 봇 준비됨: {bot.user}")
 
 
