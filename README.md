@@ -24,8 +24,15 @@ Firebase Firestore를 이용해 선수 이름, 팀 정보, 이동 정보, 구단
 - `players`: 선수 정보
 - `clubs`: 구단 프런트 정보
 - `movements`: 트레이드, FA 영입, 방출, 이적 등 선수 이동 내역
+- `leagueGames`: 리그 일정과 경기 결과(웹·Discord 봇 공용)
 - `users`: 계정 프로필과 역할 정보
 - `appMeta/bootstrap`: 첫 BOSS 계정 생성 여부
+
+## 팀 추가·수정 방법
+
+- 권장 방법: 웹에서 BOSS 또는 STAFF 계정으로 로그인 → `메뉴` → `선수·구단` → `로스터` → `구단 프런트 등록`에서 팀 코드와 색상을 저장합니다. 같은 항목의 `수정` 버튼으로 팀명·색상·프런트를 바꿀 수 있습니다.
+- 코드 기본값: `app.js`의 `DEFAULT_TEAM_META`와 Python 봇을 사용할 경우 `bot.py`의 `DEFAULT_TEAM_META`에 팀 코드를 추가합니다. Node 봇을 별도로 사용할 경우 `bot.js`의 `TEAM_META`에도 같은 코드를 추가합니다.
+- PBG는 현재 `app.js`와 운영용 `bot.py`의 기본 팀 목록에 추가되어 있습니다.
 
 ## 역할
 
@@ -354,3 +361,131 @@ Discord 서버에서 테스트합니다.
 - `FIREBASE_PRIVATE_KEY` 줄바꿈이 깨지면 Firebase Admin 초기화가 실패합니다.
 - Discord Developer Portal에서 Message Content Intent가 꺼져 있으면 `!mbo` 명령어를 읽지 못합니다.
 - 봇이 채널에 글을 못 쓰면 Discord 채널 권한과 `DISCORD_CHANNEL_ID`를 확인해야 합니다.
+
+## Python Discord 봇
+
+JS 봇 대신 Python 봇을 사용할 수 있습니다. Railway에서는 `Procfile`의 `worker: python bot.py` 설정으로 실행합니다.
+
+### 필요 파일
+
+- `bot.py`: Python Discord 봇 본체
+- `requirements.txt`: Railway가 설치할 Python 패키지 목록
+- `Procfile`: Railway worker 실행 명령
+- `.env`: 로컬 실행용 환경변수. GitHub에는 올리지 않습니다.
+
+### Python 봇 패키지
+
+```txt
+discord.py
+firebase-admin
+python-dotenv
+```
+
+로컬에서 실행하려면 아래처럼 설치합니다.
+
+```powershell
+pip install -r requirements.txt
+python bot.py
+```
+
+### 권한
+
+모든 `!mbo` 명령어는 아래 중 하나를 만족해야 실행됩니다.
+
+- Discord 서버 관리자 권한 보유자
+- 이름이 정확히 `관리자`인 역할 보유자
+- Discord 유저 ID가 `742989026625060914`인 사용자
+
+권한이 없으면 봇이 명령어를 거부합니다.
+
+### Python 봇 명령어
+
+```txt
+!mbo 도움말
+!mbo 트레이드 <이전팀> <선수명> <새팀> <상대선수명> [날짜]
+!mbo 방출 <팀> <선수명> [날짜]
+!mbo 은퇴 <팀> <선수명> [날짜]
+!mbo 임의해지 <팀> <선수명> [날짜]
+!mbo 최근이동
+!mbo 유효성검사 <타순표>
+```
+
+예시:
+
+```txt
+!mbo 트레이드 RMS Hyojung_0501 NDG mario_1313 2026-05-05
+!mbo 방출 RMS Hyojung_0501
+!mbo 은퇴 CPX mario_1313
+!mbo 임의해지 CPX mario_1313
+!mbo 최근이동
+```
+
+유효성 검사 예시:
+
+```txt
+!mbo 유효성검사
+1번 0lIl SS
+2번 macshox21 RF 교체권한
+3번 taekyeon_63 CF
+```
+
+또는:
+
+```txt
+!mbo 유효성검사
+1.Axrq__ CF
+2.CUCCl 1B
+3._w0nyu1 LF
+```
+
+봇은 타순표에서 닉네임을 분리해서 Firestore `players` 컬렉션에 등록된 선수인지 검사합니다.
+
+### Railway에서 Python 봇으로 배포
+
+1. GitHub에는 `.env`, Firebase Admin SDK JSON을 올리지 않습니다.
+2. Railway에서 GitHub 저장소를 연결합니다.
+3. Railway가 Python 프로젝트로 감지하도록 `requirements.txt`와 `Procfile`을 같이 올립니다.
+4. Railway Variables에 아래 값을 넣습니다.
+
+```env
+DISCORD_TOKEN=...
+DISCORD_CHANNEL_ID=...
+FIREBASE_PROJECT_ID=mbo-player
+FIREBASE_CLIENT_EMAIL=...
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+```
+
+5. Discord Developer Portal에서 아래 Intent를 켭니다.
+
+- `MESSAGE CONTENT INTENT`
+- `SERVER MEMBERS INTENT`
+
+6. Railway 로그에 아래 문구가 나오면 정상입니다.
+
+```txt
+MBO Python 봇 준비됨: 봇이름#0000
+```
+
+### 공지 채널 / 로그 채널 설정
+
+Python 봇에서 Discord 채널을 직접 설정할 수 있습니다.
+
+```txt
+!mbo 채널 설정 <#채널>
+!mbo 로그채널 설정 <#채널>
+```
+
+- `!mbo 채널 설정 <#채널>`: 웹 또는 Discord에서 발생한 선수 이동, FA 영입, 방출, 은퇴, 임의해지, 닉네임 변경, 로스터 등록 공지를 보내는 채널입니다.
+- `!mbo 로그채널 설정 <#채널>`: 누가, 언제, 웹 또는 Discord 어디에서 작업했는지 기록하는 채널입니다.
+- 설정값은 Firestore `appMeta/discordBot` 문서에 저장됩니다.
+- `.env`의 `DISCORD_CHANNEL_ID`는 기본 공지 채널 fallback으로만 사용됩니다.
+- `.env`에 `DISCORD_LOG_CHANNEL_ID`를 넣으면 로그 채널 기본값으로 사용할 수 있습니다.
+
+예시:
+
+```txt
+!mbo 채널 설정 #선수이동공지
+!mbo 로그채널 설정 #봇로그
+```
+
+웹에서 이동 내역 또는 로스터가 추가되면 봇이 Firestore 변경을 감지해 설정된 채널로 전송합니다. Discord 명령어로 발생한 이동은 명령어 응답과 공지 채널에 올라가고, 로그 채널에는 실행자와 명령어 정보가 기록됩니다.
