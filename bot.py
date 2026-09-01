@@ -2956,23 +2956,45 @@ def configured_reaction_roster_team():
         return FREE_AGENT_TEAM
     return team.upper() or FREE_AGENT_TEAM
 
-def commit_reaction_player_sync(member, team, author_text):
+def player_identity_from_member(member):
     discord_id = str(member.id)
     discord_name = str(member)
     display_name = normalize(getattr(member, "display_name", "")) or normalize(getattr(member, "name", "")) or discord_name
+    return discord_id, discord_name, display_name
+
+
+def sync_discord_player_identity_sync(member):
+    discord_id, discord_name, display_name = player_identity_from_member(member)
     existing_by_id = list(db.collection("players").where("discordId", "==", discord_id).limit(1).stream())
-    if existing_by_id:
-        ref = existing_by_id[0].reference
-        ref.set(
-            {
-                "discordId": discord_id,
-                "discordName": discord_name,
-                "discordDisplayName": display_name,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
-        return "updated", display_name
+    if not existing_by_id:
+        return None
+
+    snapshot = existing_by_id[0]
+    data = snapshot.to_dict()
+    previous_name = normalize(data.get("name"))
+    updates = {
+        "discordId": discord_id,
+        "discordName": discord_name,
+        "discordDisplayName": display_name,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if display_name and previous_name != display_name:
+        name_matches = [doc for doc in db.collection("players").where("name", "==", display_name).limit(2).stream() if doc.id != snapshot.id]
+        if name_matches:
+            updates["discordNameConflict"] = display_name
+            snapshot.reference.set(updates, merge=True)
+            return {"changed": False, "conflict": True, "previousName": previous_name, "displayName": display_name}
+        updates["name"] = display_name
+        updates["discordPreviousDisplayName"] = previous_name
+    snapshot.reference.set(updates, merge=True)
+    return {"changed": "name" in updates, "conflict": False, "previousName": previous_name, "displayName": display_name}
+
+
+def commit_reaction_player_sync(member, team, author_text):
+    discord_id, discord_name, display_name = player_identity_from_member(member)
+    identity_result = sync_discord_player_identity_sync(member)
+    if identity_result:
+        return "renamed" if identity_result.get("changed") else "updated", display_name
 
     existing_by_name = find_player_sync(display_name)
     if existing_by_name:
@@ -3975,6 +3997,36 @@ async def on_raw_reaction_add(payload):
         )
     except Exception as exc:
         print(f"반응 선수 자동 등록 실패: {member}: {exc}")
+
+
+@bot.event
+async def on_member_update(before, after):
+    if after.bot:
+        return
+
+    before_display = normalize(getattr(before, "display_name", ""))
+    after_display = normalize(getattr(after, "display_name", ""))
+    if before_display == after_display and str(before) == str(after):
+        return
+
+    try:
+        result = await run_blocking(sync_discord_player_identity_sync, after)
+        if result and result.get("changed"):
+            await send_log(
+                "Discord 별명 자동 반영",
+                f"{after} 님의 Discord 별명 변경을 선수명에 반영했습니다.",
+                [("이전", result.get("previousName") or "-", True), ("현재", result.get("displayName") or "-", True), ("Discord ID", after.id, False)],
+                0x0F766E,
+            )
+        elif result and result.get("conflict"):
+            await send_log(
+                "Discord 별명 자동 반영 보류",
+                "변경된 Discord 별명이 이미 다른 선수명으로 등록되어 있어 자동 변경하지 않았습니다.",
+                [("기존", result.get("previousName") or "-", True), ("변경 별명", result.get("displayName") or "-", True), ("Discord ID", after.id, False)],
+                0xF59E0B,
+            )
+    except Exception as exc:
+        print(f"Discord 별명 자동 반영 실패: {after}: {exc}")
 
 
 @bot.tree.error
