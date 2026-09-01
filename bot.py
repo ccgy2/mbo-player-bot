@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape as escape_xml
 from datetime import datetime, timedelta, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import firebase_admin
@@ -28,6 +29,10 @@ CONFIG_REF = None
 SNAPSHOT_UNSUBSCRIBES = []
 SNAPSHOTS_STARTED = False
 PUNISHMENT_SYNC_STARTED = False
+SLASH_COMMANDS_SYNCED = False
+REACTION_ROSTER_SYNCED = False
+REACTION_ROSTER_MESSAGE_ID = os.getenv("DISCORD_REACTION_ROSTER_MESSAGE_ID", "1515707426421084321")
+REACTION_ROSTER_CHANNEL_ID = os.getenv("DISCORD_REACTION_ROSTER_CHANNEL_ID", "")
 MINECRAFT_WEBHOOK_STARTED = False
 MINECRAFT_WEB_RUNNER = None
 MINECRAFT_WEBHOOK_SECRET = os.getenv("MINECRAFT_WEBHOOK_SECRET", "")
@@ -43,6 +48,7 @@ DEFAULT_ROLE_IDS = {
 }
 
 FREE_AGENT_TEAM = "무소속"
+REACTION_ROSTER_TEAM = os.getenv("DISCORD_REACTION_ROSTER_TEAM", FREE_AGENT_TEAM)
 DEFAULT_TEAM_META = {
     "PBG": {"name": "PBG", "color": 0x1D4ED8},
     FREE_AGENT_TEAM: {"name": FREE_AGENT_TEAM, "color": 0x64748B},
@@ -87,6 +93,7 @@ CONFIG_REF = db.collection("appMeta").document("discordBot")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
@@ -2872,6 +2879,765 @@ async def show_clubs_table(ctx):
     
     await ctx.send(embed=embed)
 
+
+def fetch_player_choices_sync(query_text="", limit=25):
+    lowered = normalize(query_text).lower()
+    docs = db.collection("players").order_by("name").stream()
+    choices = []
+    seen = set()
+    for doc_snapshot in docs:
+        data = doc_snapshot.to_dict()
+        name = normalize(data.get("name"))
+        if not name or name.lower() in seen:
+            continue
+        if lowered and lowered not in name.lower():
+            continue
+        seen.add(name.lower())
+        team = normalize(data.get("team")) or "팀 미정"
+        choices.append((name, f"{name} ({team})"))
+        if len(choices) >= limit:
+            break
+    return choices
+
+
+def fetch_pending_request_choices_sync(query_text="", limit=25):
+    lowered = normalize(query_text).lower()
+    docs = db.collection("movementRequests").where("status", "==", "PENDING").stream()
+    choices = []
+    for doc_snapshot in docs:
+        data = doc_snapshot.to_dict()
+        request_no = normalize(data.get("requestNo") or doc_snapshot.id)
+        payload = data.get("payload") or {}
+        label = MOVEMENT_LABELS.get(payload.get("kind"), payload.get("kind", "요청"))
+        name = f"{request_no} · {label}"
+        if lowered and lowered not in request_no.lower() and lowered not in name.lower():
+            continue
+        choices.append((request_no, name[:100]))
+        if len(choices) >= limit:
+            break
+    return choices
+
+
+def fetch_punishment_choices_sync(query_text="", limit=25):
+    lowered = normalize(query_text).lower()
+    docs = db.collection("punishments").order_by("date", direction=firestore.Query.DESCENDING).limit(100).stream()
+    choices = []
+    for doc_snapshot in docs:
+        data = doc_snapshot.to_dict()
+        key = doc_snapshot.id
+        nickname = normalize(data.get("nickname"))
+        label = f"{key[:8]} · {nickname or '대상 없음'}"
+        if lowered and lowered not in key.lower() and lowered not in nickname.lower():
+            continue
+        choices.append((key, label[:100]))
+        if len(choices) >= limit:
+            break
+    return choices
+
+
+def team_choices_sync(query_text="", limit=25, allow_free_agent=True):
+    lowered = normalize(query_text).lower()
+    teams = sorted(team_meta_sync().keys())
+    if not allow_free_agent:
+        teams = [team for team in teams if team != FREE_AGENT_TEAM]
+    choices = []
+    for team in teams:
+        if lowered and lowered not in team.lower():
+            continue
+        choices.append(team)
+        if len(choices) >= limit:
+            break
+    return choices
+
+
+def configured_reaction_roster_team():
+    team = normalize(REACTION_ROSTER_TEAM)
+    if team == FREE_AGENT_TEAM:
+        return FREE_AGENT_TEAM
+    return team.upper() or FREE_AGENT_TEAM
+
+def commit_reaction_player_sync(member, team, author_text):
+    discord_id = str(member.id)
+    discord_name = str(member)
+    display_name = normalize(getattr(member, "display_name", "")) or normalize(getattr(member, "name", "")) or discord_name
+    existing_by_id = list(db.collection("players").where("discordId", "==", discord_id).limit(1).stream())
+    if existing_by_id:
+        ref = existing_by_id[0].reference
+        ref.set(
+            {
+                "discordId": discord_id,
+                "discordName": discord_name,
+                "discordDisplayName": display_name,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return "updated", display_name
+
+    existing_by_name = find_player_sync(display_name)
+    if existing_by_name:
+        db.collection("players").document(existing_by_name["id"]).set(
+            {
+                "discordId": discord_id,
+                "discordName": discord_name,
+                "discordDisplayName": display_name,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return "linked", display_name
+
+    db.collection("players").add(
+        {
+            "name": display_name,
+            "team": team,
+            "position": "",
+            "number": "",
+            "transfer": f"{today()} Discord 반응 자동 등록: {team}",
+            "discordId": discord_id,
+            "discordName": discord_name,
+            "discordDisplayName": display_name,
+            "createdBy": "discord-reaction-import",
+            "createdByName": author_text,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+    )
+    return "created", display_name
+
+
+async def fetch_reaction_message(guild, channel, message_id):
+    if channel:
+        return await channel.fetch_message(int(message_id))
+
+    configured_channel_id = parse_channel_id(REACTION_ROSTER_CHANNEL_ID)
+    if configured_channel_id:
+        configured_channel = guild.get_channel(int(configured_channel_id)) or await bot.fetch_channel(int(configured_channel_id))
+        return await configured_channel.fetch_message(int(message_id))
+
+    bot_member = guild.me or guild.get_member(bot.user.id)
+    for text_channel in guild.text_channels:
+        permissions = text_channel.permissions_for(bot_member)
+        if not permissions.read_message_history:
+            continue
+        try:
+            return await text_channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden):
+            continue
+    raise ValueError("반응이 달린 메시지를 찾지 못했습니다. 채널을 같이 지정해주세요.")
+
+
+async def import_reaction_players(guild, channel, message_id, team, author_text):
+    message = await fetch_reaction_message(guild, channel, message_id)
+    members = {}
+    for reaction in message.reactions:
+        async for user in reaction.users(limit=None):
+            if user.bot:
+                continue
+            member = guild.get_member(user.id)
+            if not member:
+                try:
+                    member = await guild.fetch_member(user.id)
+                except discord.NotFound:
+                    member = None
+            if member:
+                members[member.id] = member
+
+    created = []
+    linked = []
+    updated = []
+    for member in members.values():
+        status, name = await run_blocking(commit_reaction_player_sync, member, team, author_text)
+        if status == "created":
+            created.append(name)
+        elif status == "linked":
+            linked.append(name)
+        else:
+            updated.append(name)
+
+    return {
+        "message_url": message.jump_url,
+        "total": len(members),
+        "created": created,
+        "linked": linked,
+        "updated": updated,
+    }
+
+async def player_name_autocomplete(interaction, current):
+    prefix = ""
+    lookup = current
+    if "," in normalize(current):
+        prefix = current.rsplit(",", 1)[0].strip() + ", "
+        lookup = current.rsplit(",", 1)[1].strip()
+    choices = await run_blocking(fetch_player_choices_sync, lookup)
+    return [app_commands.Choice(name=label, value=(prefix + value)[:100]) for value, label in choices]
+
+
+async def team_autocomplete(interaction, current):
+    teams = await run_blocking(team_choices_sync, current)
+    return [app_commands.Choice(name=team, value=team) for team in teams]
+
+
+async def active_team_autocomplete(interaction, current):
+    teams = await run_blocking(team_choices_sync, current, 25, False)
+    return [app_commands.Choice(name=team, value=team) for team in teams]
+
+
+async def request_no_autocomplete(interaction, current):
+    choices = await run_blocking(fetch_pending_request_choices_sync, current)
+    return [app_commands.Choice(name=label, value=value) for value, label in choices]
+
+
+async def punishment_id_autocomplete(interaction, current):
+    choices = await run_blocking(fetch_punishment_choices_sync, current)
+    return [app_commands.Choice(name=label, value=value) for value, label in choices]
+
+
+async def slash_guard(interaction):
+    if is_authorized_member(interaction.user):
+        return True
+    await interaction.response.send_message("이 명령어는 Discord 관리자 또는 지정된 관리자만 사용할 수 있습니다.", ephemeral=True)
+    return False
+
+
+async def can_member_request_for_team(member, team):
+    if is_authorized_member(member):
+        return True
+    if await has_owner_role(member):
+        return True
+    owners = await configured_team_owners()
+    return normalize(owners.get(normalize(team).upper())) == str(member.id)
+
+
+async def slash_team_guard(interaction, team):
+    if await can_member_request_for_team(interaction.user, team):
+        return True
+    await interaction.response.send_message(f"{team} 구단주 또는 관리자만 이 요청을 만들 수 있습니다.", ephemeral=True)
+    return False
+
+
+async def slash_send_error(interaction, error):
+    message = str(error)
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+@app_commands.command(name="도움말", description="MBO 봇 명령어 도움말을 봅니다.")
+async def slash_help(interaction):
+    if not await slash_guard(interaction):
+        return
+    embed = discord.Embed(title="MBO 봇 슬래시 명령어", color=0x0F766E)
+    embed.description = "기존 ! 명령어는 그대로 사용할 수 있고, 같은 기능을 / 명령어로도 사용할 수 있습니다."
+    for name in [
+        "/등록", "/반응선수등록", "/승인", "/거부", "/트레이드", "/영입", "/방출", "/은퇴", "/임의해지",
+        "/닉네임변경", "/로스터", "/정보", "/처벌기록", "/처벌", "/처벌수정", "/처벌삭제", "/최근이동",
+        "/유효성검사", "/채널", "/로그채널", "/역할", "/역할목록", "/역할진단", "/구단주", "/이동",
+    ]:
+        embed.add_field(name=name, value="Discord 입력창에서 옵션 자동완성을 사용할 수 있습니다.", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@app_commands.command(name="반응선수등록", description="특정 메시지에 반응한 사람을 무소속 선수로 자동 등록합니다.")
+@app_commands.autocomplete(team=team_autocomplete)
+async def slash_import_reaction_players(interaction, channel: discord.TextChannel = None, message_id: str = REACTION_ROSTER_MESSAGE_ID, team: str = FREE_AGENT_TEAM):
+    if not await slash_guard(interaction):
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        target_team = normalize(team).upper() if normalize(team) != FREE_AGENT_TEAM else FREE_AGENT_TEAM
+        if not valid_team_sync(target_team, allow_free_agent=True):
+            raise ValueError(f"팀 코드를 확인해주세요: {team}")
+        result = await import_reaction_players(interaction.guild, channel, normalize(message_id) or REACTION_ROSTER_MESSAGE_ID, target_team, str(interaction.user))
+        embed = discord.Embed(title="반응 선수 자동 등록 완료", color=0x0F766E, timestamp=datetime.now(timezone.utc))
+        embed.description = f"총 {result['total']}명을 확인했습니다."
+        embed.add_field(name="신규 등록", value="\n".join(result["created"][:20]) or "-", inline=False)
+        embed.add_field(name="기존 선수 연결", value="\n".join(result["linked"][:20]) or "-", inline=False)
+        embed.add_field(name="이미 등록됨", value="\n".join(result["updated"][:20]) or "-", inline=False)
+        embed.add_field(name="메시지", value=result["message_url"], inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_log("반응 선수 자동 등록", f"{interaction.user} 님이 반응자 {result['total']}명을 동기화했습니다.", [], 0x0F766E)
+    except Exception as exc:
+        await interaction.followup.send(f"반응 선수 등록 실패: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="등록", description="선수 등록 승인 요청을 만듭니다.")
+@app_commands.autocomplete(team=team_autocomplete)
+async def slash_register(interaction, name: str, team: str):
+    try:
+        parsed_name, parsed_team = parse_register_args(f"{name} {team}")
+        request_no = await run_blocking(create_movement_request_sync, {
+            "kind": "REGISTER", "name": parsed_name, "team": parsed_team, "date": today(),
+            "requesterId": str(interaction.user.id), "requesterName": str(interaction.user),
+        })
+        await interaction.response.send_message(embed=movement_request_embed(request_no, {"kind": "REGISTER", "name": parsed_name, "team": parsed_team, "date": today(), "requesterName": str(interaction.user)}))
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="승인", description="승인 대기 요청을 최종 승인합니다.")
+@app_commands.autocomplete(request_no=request_no_autocomplete)
+async def slash_approve(interaction, admin: discord.Member, request_no: str):
+    if not await slash_guard(interaction):
+        return
+    if admin.id != interaction.user.id or not is_authorized_member(admin):
+        await interaction.response.send_message("최종 승인자는 명령을 실행한 관리자 본인이어야 합니다.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    try:
+        request_id, request_data = await run_blocking(fetch_pending_request_sync, request_no)
+        payload = request_data.get("payload") or {}
+        await run_blocking(approve_movement_request_sync, request_id, payload, str(interaction.user))
+        kind = payload.get("kind")
+        if kind == "REGISTER":
+            role_results = await sync_roles_for_player_registration(payload.get("name"), payload.get("team"))
+            embed = player_event_embed({"name": payload.get("name"), "team": payload.get("team")})
+            embed.title = "로스터 등록 승인"
+        elif kind == "TRADE":
+            role_results = await sync_roles_for_discord_movement(kind, payload.get("fromTeam"), payload.get("fromPlayers", []), payload.get("toTeam"), payload.get("date"), payload.get("toPlayers", []))
+            embed = movement_embed(kind, payload.get("date"), payload.get("fromTeam"), payload.get("fromPlayers", []), payload.get("toTeam"), payload.get("toPlayers", []))
+        elif kind == "NICKNAME":
+            role_results = []
+            embed = discord.Embed(title="🔄 닉네임 변경 승인", color=team_color(payload.get("team")), timestamp=datetime.now(timezone.utc))
+            embed.add_field(name="변경", value=f"{payload.get('oldName', '-')} → {payload.get('newName', '-')}", inline=False)
+            embed.add_field(name="팀", value=payload.get("team", "-"), inline=True)
+            embed.add_field(name="날짜", value=payload.get("date", "-"), inline=True)
+        else:
+            players = payload.get("players", [])
+            role_results = await sync_roles_for_discord_movement(kind, payload.get("fromTeam"), players, payload.get("toTeam", "무소속"), payload.get("date"))
+            embed = movement_embed(kind, payload.get("date"), payload.get("fromTeam", "무소속"), players, payload.get("toTeam", "무소속"), reason=payload.get("reason", ""))
+        embed.add_field(name="요청번호", value=request_no, inline=True)
+        embed.add_field(name="승인자", value=interaction.user.mention, inline=True)
+        add_role_sync_result(embed, role_results)
+        await interaction.followup.send(embed=embed)
+        await send_announcement(embed)
+    except Exception as exc:
+        await interaction.followup.send(f"승인 실패: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="거부", description="승인 대기 요청을 거부합니다.")
+@app_commands.autocomplete(request_no=request_no_autocomplete)
+async def slash_deny(interaction, admin: discord.Member, request_no: str):
+    if not await slash_guard(interaction):
+        return
+    if admin.id != interaction.user.id or not is_authorized_member(admin):
+        await interaction.response.send_message("최종 거부자는 명령을 실행한 관리자 본인이어야 합니다.", ephemeral=True)
+        return
+    try:
+        request_id, request_data = await run_blocking(fetch_pending_request_sync, request_no)
+        await run_blocking(mark_request_denied_sync, request_id, str(interaction.user))
+        payload = request_data.get("payload") or {}
+        label = MOVEMENT_LABELS.get(payload.get("kind"), payload.get("kind", "요청"))
+        await interaction.response.send_message(f"{label} 요청 `{request_no}` 을 거부했습니다.")
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="트레이드", description="트레이드 요청을 만듭니다.")
+@app_commands.autocomplete(from_team=active_team_autocomplete, from_players=player_name_autocomplete, to_team=active_team_autocomplete, to_players=player_name_autocomplete)
+async def slash_trade(interaction, from_team: str, from_players: str, to_team: str, to_players: str, date: str = ""):
+    try:
+        date = normalize(date) or today()
+        if not await slash_team_guard(interaction, from_team.upper()):
+            return
+        result = await run_blocking(create_trade_consent_sync, {
+            "kind": "TRADE", "fromTeam": from_team.upper(), "fromPlayers": parse_names(from_players), "toTeam": to_team.upper(),
+            "toPlayers": parse_names(to_players), "date": date, "requesterTeam": from_team.upper(),
+            "requesterId": str(interaction.user.id), "requesterName": str(interaction.user),
+        })
+        if not result.get("ready"):
+            await interaction.response.send_message(f"트레이드 요청을 접수했습니다. 상대 팀 요청을 기다립니다.", ephemeral=False)
+            return
+        request_no = result.get("requestNo")
+        await interaction.response.send_message(embed=movement_request_embed(request_no, {"kind": "TRADE", "fromTeam": from_team.upper(), "fromPlayers": parse_names(from_players), "toTeam": to_team.upper(), "toPlayers": parse_names(to_players), "date": date, "requesterName": str(interaction.user)}))
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="영입", description="FA 영입 승인 요청을 만듭니다.")
+@app_commands.autocomplete(players=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_fa_sign(interaction, players: str, team: str, reason: str = "", date: str = ""):
+    team = normalize(team).upper()
+    if not await slash_team_guard(interaction, team):
+        return
+    payload = {"kind": "FA_SIGN", "fromTeam": FREE_AGENT_TEAM, "players": parse_names(players), "toTeam": team, "date": normalize(date) or today(), "reason": reason, "requesterId": str(interaction.user.id), "requesterName": str(interaction.user)}
+    request_no = await run_blocking(create_movement_request_sync, payload)
+    await interaction.response.send_message(embed=movement_request_embed(request_no, payload))
+
+
+async def slash_simple_movement(interaction, kind, players, team, reason, date):
+    team = normalize(team).upper()
+    if not await slash_team_guard(interaction, team):
+        return
+    payload = {"kind": kind, "fromTeam": team, "players": parse_names(players), "toTeam": FREE_AGENT_TEAM, "date": normalize(date) or today(), "reason": reason, "requesterId": str(interaction.user.id), "requesterName": str(interaction.user)}
+    request_no = await run_blocking(create_movement_request_sync, payload)
+    await interaction.response.send_message(embed=movement_request_embed(request_no, payload))
+
+
+@app_commands.command(name="방출", description="방출 승인 요청을 만듭니다.")
+@app_commands.autocomplete(players=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_release(interaction, players: str, team: str, reason: str = "", date: str = ""):
+    await slash_simple_movement(interaction, "RELEASE", players, team, reason, date)
+
+
+@app_commands.command(name="은퇴", description="은퇴 승인 요청을 만듭니다.")
+@app_commands.autocomplete(players=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_retire(interaction, players: str, team: str, reason: str = "", date: str = ""):
+    await slash_simple_movement(interaction, "RETIRE", players, team, reason, date)
+
+
+@app_commands.command(name="임의해지", description="임의해지 승인 요청을 만듭니다.")
+@app_commands.autocomplete(players=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_forced_release(interaction, players: str, team: str, reason: str = "", date: str = ""):
+    await slash_simple_movement(interaction, "FORCED_RELEASE", players, team, reason, date)
+
+
+@app_commands.command(name="이동", description="이동 유형을 선택해서 승인 요청을 만듭니다.")
+@app_commands.choices(movement_type=[app_commands.Choice(name="영입", value="영입"), app_commands.Choice(name="방출", value="방출"), app_commands.Choice(name="은퇴", value="은퇴"), app_commands.Choice(name="임의해지", value="임의해지")])
+@app_commands.autocomplete(players=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_movement(interaction, movement_type: app_commands.Choice[str], players: str, team: str, reason: str = "", date: str = ""):
+    kind_map = {"영입": "FA_SIGN", "방출": "RELEASE", "은퇴": "RETIRE", "임의해지": "FORCED_RELEASE"}
+    if movement_type.value == "영입":
+        team = normalize(team).upper()
+        if not await slash_team_guard(interaction, team):
+            return
+        payload = {
+            "kind": "FA_SIGN",
+            "fromTeam": FREE_AGENT_TEAM,
+            "players": parse_names(players),
+            "toTeam": team,
+            "date": normalize(date) or today(),
+            "reason": reason,
+            "requesterId": str(interaction.user.id),
+            "requesterName": str(interaction.user),
+        }
+        request_no = await run_blocking(create_movement_request_sync, payload)
+        await interaction.response.send_message(embed=movement_request_embed(request_no, payload))
+    else:
+        await slash_simple_movement(interaction, kind_map[movement_type.value], players, team, reason, date)
+
+
+@app_commands.command(name="닉네임변경", description="닉네임 변경 승인 요청을 만듭니다.")
+@app_commands.autocomplete(old_name=player_name_autocomplete, team=active_team_autocomplete)
+async def slash_nickname_change(interaction, old_name: str, new_name: str, team: str, date: str = ""):
+    try:
+        team = normalize(team).upper()
+        if not await slash_team_guard(interaction, team):
+            return
+        payload = {"kind": "NICKNAME", "oldName": old_name, "newName": new_name, "team": team, "fromTeam": team, "toTeam": team, "date": normalize(date) or today(), "requesterId": str(interaction.user.id), "requesterName": str(interaction.user)}
+        request_no = await run_blocking(create_movement_request_sync, payload)
+        await interaction.response.send_message(embed=movement_request_embed(request_no, payload))
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="최근이동", description="최근 이동 내역 5건을 조회합니다.")
+async def slash_recent(interaction):
+    if not await slash_guard(interaction):
+        return
+    records = await run_blocking(fetch_recent_movements_sync)
+    embed = discord.Embed(title="최근 이동 내역", color=0x0F766E, timestamp=datetime.now(timezone.utc))
+    if not records:
+        embed.description = "등록된 이동 내역이 없습니다."
+    for data in records:
+        embed.add_field(name=f"{data.get('date', '-')} · {MOVEMENT_LABELS.get(data.get('type'), data.get('type', '이동'))}", value=f"{data.get('playerName', '-')}\n{movement_route_text(data)}", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@app_commands.command(name="로스터", description="팀 로스터를 조회합니다.")
+@app_commands.autocomplete(team=active_team_autocomplete)
+async def slash_roster(interaction, team: str):
+    team = normalize(team).upper()
+    if not valid_team_sync(team):
+        await interaction.response.send_message("팀 코드를 확인해주세요.", ephemeral=True)
+        return
+    players = await run_blocking(fetch_team_roster_sync, team)
+    embed = discord.Embed(title=f"{team} 로스터", color=team_color(team), timestamp=datetime.now(timezone.utc))
+    embed.description = f"총 {len(players)}명"
+    if players:
+        embed.add_field(name="선수 목록", value="\n".join(f"{i}. {normalize(p.get('name'))} · {normalize(p.get('position')) or '-'} · No.{normalize(p.get('number')) or '-'}" for i, p in enumerate(players[:20], 1)), inline=False)
+    await interaction.response.send_message(embed=embed, view=RosterDownloadView(team, players))
+
+
+@app_commands.command(name="정보", description="선수 이적 정보를 조회합니다.")
+@app_commands.autocomplete(player_name=player_name_autocomplete)
+async def slash_transfer_info(interaction, player_name: str):
+    try:
+        player, movements = await run_blocking(fetch_player_transfer_info_sync, player_name)
+        if normalize(player.get("name")).lower() not in discord_member_names(interaction.user) and not await can_member_request_for_team(interaction.user, player.get("team")) and not is_authorized_member(interaction.user):
+            await interaction.response.send_message("이 선수의 이적 정보를 볼 권한이 없습니다.", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=transfer_info_embed(player, movements), view=TransferInfoDownloadView(player, movements))
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="처벌기록", description="선수 또는 팀 처벌 기록을 조회합니다.")
+@app_commands.autocomplete(query_text=player_name_autocomplete)
+async def slash_punishment_record(interaction, query_text: str):
+    records = await run_blocking(fetch_punishments_sync, query_text)
+    await interaction.response.send_message(embed=punishment_embed(f"{query_text} 처벌 기록", records))
+
+
+@app_commands.command(name="처벌", description="처벌 기록을 등록합니다.")
+@app_commands.autocomplete(nickname=player_name_autocomplete)
+async def slash_punishment(interaction, reason: str, nickname: str, penalty: str, note: str = ""):
+    if not await slash_guard(interaction):
+        return
+    team = await run_blocking(find_player_team_by_name_sync, nickname)
+    payload = punishment_payload(nickname, team, reason, penalty, note, author_text=str(interaction.user))
+    await run_blocking(add_punishment_sync, payload)
+    await interaction.response.send_message(embed=punishment_embed(f"{nickname} 처벌 등록", [payload]))
+
+
+@app_commands.command(name="처벌수정", description="처벌 기록을 수정합니다.")
+@app_commands.autocomplete(punishment_id=punishment_id_autocomplete, nickname=player_name_autocomplete)
+async def slash_punishment_update(interaction, punishment_id: str, reason: str, nickname: str, penalty: str, note: str = ""):
+    if not await slash_guard(interaction):
+        return
+    team = await run_blocking(find_player_team_by_name_sync, nickname)
+    payload = punishment_payload(nickname, team, reason, penalty, note, author_text=str(interaction.user))
+    await run_blocking(update_punishment_sync, punishment_id, payload)
+    await interaction.response.send_message(embed=punishment_embed(f"{nickname} 처벌 수정", [{"id": punishment_id, **payload}]))
+
+
+@app_commands.command(name="처벌삭제", description="처벌 기록을 삭제합니다.")
+@app_commands.autocomplete(punishment_id=punishment_id_autocomplete)
+async def slash_punishment_delete(interaction, punishment_id: str):
+    if not await slash_guard(interaction):
+        return
+    await run_blocking(delete_punishment_sync, punishment_id)
+    await interaction.response.send_message(f"처벌 기록 `{punishment_id}` 을 삭제했습니다.")
+
+
+@app_commands.command(name="채널", description="웹/Discord 공지 채널을 설정합니다.")
+async def slash_set_channel(interaction, channel: discord.TextChannel):
+    if not await slash_guard(interaction):
+        return
+    await set_bot_config({"channelId": str(channel.id)})
+    await interaction.response.send_message(f"웹/Discord 공지 채널을 {channel.mention} 로 설정했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="로그채널", description="로그 채널을 설정합니다.")
+async def slash_set_log_channel(interaction, channel: discord.TextChannel):
+    if not await slash_guard(interaction):
+        return
+    await set_bot_config({"logChannelId": str(channel.id)})
+    await interaction.response.send_message(f"로그 채널을 {channel.mention} 로 설정했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="역할목록", description="현재 역할 설정을 봅니다.")
+async def slash_role_list(interaction):
+    if not await slash_guard(interaction):
+        return
+    role_ids = await configured_role_ids()
+    lines = [f"{team}: <@&{role_id}>" for team, role_id in sorted(role_ids["teams"].items())]
+    if role_ids.get("owner"):
+        lines.append(f"구단주: <@&{role_ids['owner']}>")
+    lines.append(f"은퇴: <@&{role_ids['retire']}>")
+    lines.append(f"임의탈퇴/임의해지: <@&{role_ids['forcedRelease']}>")
+    await interaction.response.send_message("현재 역할 설정입니다.\n" + "\n".join(lines), ephemeral=True)
+
+
+@app_commands.command(name="역할", description="팀/상태 역할을 설정합니다.")
+@app_commands.choices(category=[app_commands.Choice(name="팀", value="팀"), app_commands.Choice(name="구단주", value="구단주"), app_commands.Choice(name="은퇴", value="은퇴"), app_commands.Choice(name="임의해지", value="임의해지")])
+@app_commands.autocomplete(team=active_team_autocomplete)
+async def slash_set_role(interaction, category: app_commands.Choice[str], role: discord.Role, team: str = ""):
+    if not await slash_guard(interaction):
+        return
+    role_ids = await configured_role_ids()
+    if category.value == "팀":
+        target_team = normalize(team).upper()
+        if not target_team:
+            await interaction.response.send_message("팀 역할은 팀 코드를 입력해야 합니다.", ephemeral=True)
+            return
+        role_ids["teams"][target_team] = str(role.id)
+    elif category.value == "구단주":
+        role_ids["owner"] = str(role.id)
+    elif category.value == "은퇴":
+        role_ids["retire"] = str(role.id)
+    else:
+        role_ids["forcedRelease"] = str(role.id)
+    await set_bot_config({"roleIds": role_ids})
+    await interaction.response.send_message(f"{category.name} 역할을 {role.mention} 로 설정했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="구단주", description="팀 구단주를 지정합니다.")
+@app_commands.autocomplete(team=active_team_autocomplete)
+async def slash_team_owner(interaction, member: discord.Member, team: str):
+    if not await slash_guard(interaction):
+        return
+    team = normalize(team).upper()
+    config = await get_bot_config()
+    owners = merge_team_owners(config)
+    owners[team] = str(member.id)
+    await set_bot_config({"teamOwners": owners})
+    await interaction.response.send_message(f"{team} 구단주를 {member.mention} 로 설정했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="역할진단", description="선수와 일치하는 Discord 멤버의 역할 상태를 확인합니다.")
+@app_commands.autocomplete(player_name=player_name_autocomplete)
+async def slash_role_diagnosis(interaction, player_name: str):
+    if not await slash_guard(interaction):
+        return
+    lines = []
+    role_ids = await configured_role_ids()
+    managed_role_ids = set(role_ids["teams"].values()) | {role_ids["retire"], role_ids["forcedRelease"]}
+    managed_role_ids.discard("")
+    for guild in bot.guilds:
+        member = await find_member_by_player_name(guild, player_name)
+        if member:
+            member_roles = [role.name for role in member.roles if str(role.id) in managed_role_ids]
+            lines.append(f"{guild.name}: {member.mention}\n관리 역할: {', '.join(member_roles) if member_roles else '없음'}")
+    await interaction.response.send_message("\n\n".join(lines)[:1900] if lines else "일치하는 멤버를 찾지 못했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="유효성검사", description="타순표 닉네임이 로스터에 있는지 검사합니다.")
+async def slash_validate_roster(interaction, lineup_text: str):
+    if not await slash_guard(interaction):
+        return
+    entries = [entry for entry in (parse_lineup_line(line) for line in lineup_text.splitlines()) if entry]
+    found = []
+    missing = []
+    for entry in entries:
+        player = await find_player(entry["name"])
+        if player:
+            found.append(f"{entry['name']} {entry['position']} · {player.get('team', '팀 미정')}")
+        else:
+            missing.append(f"{entry['name']} {entry['position']}".strip())
+    embed = discord.Embed(title="로스터 유효성 검사", color=0x0F766E)
+    embed.add_field(name=f"등록됨 ({len(found)})", value="\n".join(found)[:1024] if found else "-", inline=False)
+    embed.add_field(name=f"미등록 ({len(missing)})", value="\n".join(missing)[:1024] if missing else "-", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+for slash_command in [
+    slash_help, slash_import_reaction_players, slash_register, slash_approve, slash_deny, slash_trade, slash_fa_sign,
+    slash_release, slash_retire, slash_forced_release, slash_movement, slash_nickname_change, slash_recent, slash_roster,
+    slash_transfer_info, slash_punishment_record, slash_punishment, slash_punishment_update, slash_punishment_delete,
+    slash_set_channel, slash_set_log_channel, slash_role_list, slash_set_role, slash_team_owner, slash_role_diagnosis,
+    slash_validate_roster,
+]:
+    bot.tree.add_command(slash_command)
+
+@app_commands.command(name="처벌채널설정", description="처벌 기록 공지 채널을 설정합니다.")
+async def slash_set_punishment_channel(interaction, channel: discord.TextChannel):
+    if not await slash_guard(interaction):
+        return
+    await set_bot_config({"punishmentChannelId": str(channel.id)})
+    await interaction.response.send_message(f"처벌 기록 채널을 {channel.mention} 로 설정했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="리그일정", description="리그 일정을 등록합니다.")
+@app_commands.autocomplete(home_team=active_team_autocomplete, away_team=active_team_autocomplete, home_starter=player_name_autocomplete, away_starter=player_name_autocomplete)
+async def slash_league_schedule(interaction, home_team: str, away_team: str, stadium: str, home_starter: str, away_starter: str, date: str, time: str):
+    if not await slash_guard(interaction):
+        return
+    try:
+        home_team, away_team = home_team.upper(), away_team.upper()
+        game_datetime = normalize_game_datetime(date, time)
+        payload = {"homeTeam": home_team, "awayTeam": away_team, "stadium": stadium, "homeStarter": home_starter, "awayStarter": away_starter, "gameDateTime": game_datetime, "status": "SCHEDULED", "createdBy": str(interaction.user.id), "createdByName": str(interaction.user), "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+        reference = await asyncio.to_thread(lambda: db.collection("leagueGames").add(payload))
+        await interaction.response.send_message(f"리그 일정 등록 완료: {away_team} VS {home_team} · ID {reference[1].id}")
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="리그결과", description="리그 결과를 등록합니다.")
+@app_commands.autocomplete(home_team=active_team_autocomplete, away_team=active_team_autocomplete, winning_pitcher=player_name_autocomplete, losing_pitcher=player_name_autocomplete)
+async def slash_league_result(interaction, home_team: str, away_team: str, home_score: int, away_score: int, winning_pitcher: str, losing_pitcher: str, date: str, time: str, hold_pitcher: str = "", save_pitcher: str = ""):
+    if not await slash_guard(interaction):
+        return
+    try:
+        game_datetime = normalize_game_datetime(date, time)
+        payload = {"homeTeam": home_team.upper(), "awayTeam": away_team.upper(), "homeScore": home_score, "awayScore": away_score, "winningPitcher": winning_pitcher, "losingPitcher": losing_pitcher, "holdPitcher": hold_pitcher, "savePitcher": save_pitcher, "gameDateTime": game_datetime, "status": "COMPLETED", "updatedBy": str(interaction.user.id), "updatedByName": str(interaction.user), "updatedAt": firestore.SERVER_TIMESTAMP, "createdAt": firestore.SERVER_TIMESTAMP}
+        game_id = await asyncio.to_thread(lambda: db.collection("leagueGames").add(payload)[1].id)
+        await interaction.response.send_message(f"경기 결과 등록 완료: {away_team.upper()} {away_score} : {home_score} {home_team.upper()} · ID {game_id}")
+    except Exception as exc:
+        await slash_send_error(interaction, exc)
+
+
+@app_commands.command(name="팀등록", description="팀을 등록합니다.")
+async def slash_team_create(interaction, code: str, display_name: str):
+    if not await slash_guard(interaction):
+        return
+    code = normalize(code).upper()
+    def create_team():
+        existing = find_club_by_code_sync(code)
+        if existing:
+            return existing.id, True
+        return db.collection("clubs").add({"name": code, "code": code, "displayName": display_name, "color": "#64748B", "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP})[1].id, False
+    club_id, existed = await asyncio.to_thread(create_team)
+    await interaction.response.send_message(f"{'이미 있는 팀입니다' if existed else '팀 등록 완료'}: {display_name} ({code}) · ID {club_id}", ephemeral=True)
+
+
+@app_commands.command(name="팀수정", description="팀 정보를 수정합니다.")
+@app_commands.autocomplete(code=active_team_autocomplete)
+@app_commands.choices(field=[app_commands.Choice(name="이름", value="이름"), app_commands.Choice(name="색상", value="색상"), app_commands.Choice(name="창단일", value="창단일"), app_commands.Choice(name="구단주", value="구단주"), app_commands.Choice(name="로고", value="로고")])
+async def slash_team_update(interaction, code: str, field: app_commands.Choice[str], value: str):
+    if not await slash_guard(interaction):
+        return
+    key = {"이름": "displayName", "색상": "color", "창단일": "foundedDate", "구단주": "owner", "로고": "logoUrl"}[field.value]
+    def update_team():
+        existing = find_club_by_code_sync(code)
+        if not existing:
+            return False
+        existing.reference.set({key: value, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        return True
+    ok = await asyncio.to_thread(update_team)
+    await interaction.response.send_message(f"{code.upper()} 팀 수정 완료" if ok else f"{code.upper()} 팀을 찾지 못했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="팀확인", description="팀 인식 상태를 확인합니다.")
+@app_commands.autocomplete(code=active_team_autocomplete)
+async def slash_team_check(interaction, code: str):
+    meta = await asyncio.to_thread(team_meta_sync)
+    team = meta.get(normalize(code).upper())
+    await interaction.response.send_message(f"정상: {code.upper()} · {team.get('name', code.upper())}" if team else f"{code.upper()} 팀을 찾지 못했습니다.", ephemeral=True)
+
+
+@app_commands.command(name="구단목록", description="구단 목록을 조회합니다.")
+async def slash_club_list(interaction):
+    docs = await asyncio.to_thread(lambda: list(db.collection("clubs").stream()))
+    lines = [normalize(doc.to_dict().get("displayName") or doc.to_dict().get("name")) for doc in docs]
+    await interaction.response.send_message("\n".join(lines[:50]) if lines else "등록된 구단이 없습니다.", ephemeral=True)
+
+
+for extra_slash_command in [slash_set_punishment_channel, slash_league_schedule, slash_league_result, slash_team_create, slash_team_update, slash_team_check, slash_club_list]:
+    bot.tree.add_command(extra_slash_command)
+
+@app_commands.command(name="팀명령어", description="팀 관리 명령어 예시를 봅니다.")
+async def slash_team_help(interaction):
+    embed = discord.Embed(title="팀 관리 쉬운 명령어", color=0x0F766E)
+    embed.add_field(name="팀 등록", value="/팀등록 code:PBG display_name:퍼펙트 베이스볼 가디언즈", inline=False)
+    embed.add_field(name="팀 수정", value="/팀수정 code:PBG field:색상 value:#1D4ED8", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@app_commands.command(name="구단설정", description="구단 고급 정보를 설정합니다.")
+async def slash_configure_club(interaction, code: str, display_name: str, color: str, founded_date: str = "", owner: str = "", logo_url: str = ""):
+    if not await slash_guard(interaction):
+        return
+    code = normalize(code).upper()
+    parsed_color = parse_hex_color(color)
+    if parsed_color is None:
+        await interaction.response.send_message("색상은 #RRGGBB 형식으로 입력해주세요.", ephemeral=True)
+        return
+    payload = {"name": code, "code": code, "displayName": display_name, "color": f"#{parsed_color:06X}", "foundedDate": founded_date, "owner": owner, "logoUrl": logo_url, "updatedBy": str(interaction.user.id), "updatedByName": str(interaction.user), "updatedAt": firestore.SERVER_TIMESTAMP}
+    def save_club():
+        existing = find_club_by_code_sync(code)
+        if existing:
+            existing.reference.set(payload, merge=True)
+            return existing.id, True
+        payload["createdAt"] = firestore.SERVER_TIMESTAMP
+        return db.collection("clubs").add(payload)[1].id, False
+    club_id, updated = await asyncio.to_thread(save_club)
+    await interaction.response.send_message(f"구단 {'수정' if updated else '등록'} 완료: {display_name} ({code}) · ID {club_id}", ephemeral=True)
+
+
+bot.tree.add_command(slash_team_help)
+bot.tree.add_command(slash_configure_club)
 def movement_event_embed(data):
     kind = data.get("type", "이동")
     label = MOVEMENT_LABELS.get(kind, kind)
@@ -3142,6 +3908,86 @@ async def start_minecraft_webhook():
     print(f"Minecraft 웹훅 준비됨: port {MINECRAFT_WEBHOOK_PORT}")
 
 
+async def sync_existing_reaction_roster_once():
+    global REACTION_ROSTER_SYNCED
+    if REACTION_ROSTER_SYNCED:
+        return
+    REACTION_ROSTER_SYNCED = True
+
+    message_id = normalize(REACTION_ROSTER_MESSAGE_ID)
+    if not message_id:
+        return
+
+    team = configured_reaction_roster_team()
+    if not valid_team_sync(team, allow_free_agent=True):
+        print(f"반응 자동 등록 기본 팀이 올바르지 않습니다: {team}")
+        return
+
+    for guild in bot.guilds:
+        try:
+            result = await import_reaction_players(guild, None, message_id, team, "Discord reaction auto sync")
+            print(f"반응 기존 등록 동기화 완료: {guild.name} / {result['total']}명")
+            await send_log(
+                "반응 기존 선수 자동 등록",
+                f"봇 시작 시 기존 반응자 {result['total']}명을 동기화했습니다.",
+                [("서버", guild.name, True), ("메시지", result["message_url"], False)],
+                0x0F766E,
+            )
+        except Exception as exc:
+            print(f"반응 기존 등록 동기화 실패: {guild.name}: {exc}")
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if str(payload.message_id) != normalize(REACTION_ROSTER_MESSAGE_ID):
+        return
+    if payload.guild_id is None or payload.user_id == bot.user.id:
+        return
+
+    configured_channel_id = parse_channel_id(REACTION_ROSTER_CHANNEL_ID)
+    if configured_channel_id and str(payload.channel_id) != configured_channel_id:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+
+    try:
+        member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+    except discord.NotFound:
+        return
+
+    if member.bot:
+        return
+
+    team = configured_reaction_roster_team()
+    if not valid_team_sync(team, allow_free_agent=True):
+        print(f"반응 자동 등록 기본 팀이 올바르지 않습니다: {team}")
+        return
+
+    try:
+        status, name = await run_blocking(commit_reaction_player_sync, member, team, "Discord reaction auto add")
+        await send_log(
+            "반응 선수 자동 등록",
+            f"{member} 님이 지정 메시지에 반응하여 선수 DB에 반영되었습니다.",
+            [("처리", status, True), ("선수명", name, True), ("Discord ID", member.id, False)],
+            0x0F766E,
+        )
+    except Exception as exc:
+        print(f"반응 선수 자동 등록 실패: {member}: {exc}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    original = getattr(error, "original", error)
+    print("슬래시 명령어 처리 오류:", repr(original))
+    message = str(original) or "슬래시 명령어 처리 중 오류가 발생했습니다."
+    if interaction.response.is_done():
+        await interaction.followup.send(message[:1900], ephemeral=True)
+    else:
+        await interaction.response.send_message(message[:1900], ephemeral=True)
+
+
 @bot.event
 async def on_command_error(ctx, error):
     original = getattr(error, "original", error)
@@ -3168,8 +4014,20 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
+    global SLASH_COMMANDS_SYNCED
+    if not SLASH_COMMANDS_SYNCED:
+        for guild in bot.guilds:
+            try:
+                guild_object = discord.Object(id=guild.id)
+                bot.tree.copy_global_to(guild=guild_object)
+                synced = await bot.tree.sync(guild=guild_object)
+                print(f"Discord 서버 슬래시 명령어 동기화 완료: {guild.name} / {len(synced)}개")
+            except Exception as exc:
+                print(f"Discord 서버 슬래시 명령어 동기화 실패: {guild.name}: {exc}")
+        SLASH_COMMANDS_SYNCED = True
     start_firestore_watchers()
     start_punishment_sheet_sync()
+    await sync_existing_reaction_roster_once()
     await start_minecraft_webhook()
     print(f"KMB Python 봇 준비됨: {bot.user}")
 
