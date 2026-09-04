@@ -2132,6 +2132,8 @@ async def league_result_command(ctx, *, args: str = ""):
 
 @bot.command(name="도움말")
 async def help_command(ctx):
+    if not any(getattr(role, "name", "") != "@everyone" for role in getattr(ctx.author, "roles", [])):
+        return
     if not await guard(ctx):
         return
 
@@ -4045,7 +4047,6 @@ async def on_command_error(ctx, error):
     original = getattr(error, "original", error)
 
     if isinstance(error, commands.CommandNotFound):
-        await ctx.reply("알 수 없는 명령어입니다. `!도움말`을 입력해보세요.")
         return
 
     if isinstance(error, commands.MissingRequiredArgument):
