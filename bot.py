@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 from aiohttp import web
+from roster_sync import FirestoreRosterStore, Identity, RosterSynchronizer, is_active_player, snowflake
 
 
 load_dotenv()
@@ -33,6 +34,11 @@ SLASH_COMMANDS_SYNCED = False
 REACTION_ROSTER_SYNCED = False
 REACTION_ROSTER_MESSAGE_ID = os.getenv("DISCORD_REACTION_ROSTER_MESSAGE_ID", "1515707426421084321")
 REACTION_ROSTER_CHANNEL_ID = os.getenv("DISCORD_REACTION_ROSTER_CHANNEL_ID", "")
+ROSTER_GUILD_ID = os.getenv("DISCORD_ROSTER_GUILD_ID", "")
+ROSTER_ROLE_IDS = os.getenv("DISCORD_ROSTER_ROLE_IDS", os.getenv("DISCORD_ROSTER_ROLE_ID", ""))
+ROSTER_SYNC_TASK = None
+ROSTER_SYNC_SERVICE = None
+ROSTER_CONFIGURATION_LOCK = asyncio.Lock()
 MINECRAFT_WEBHOOK_STARTED = False
 MINECRAFT_WEB_RUNNER = None
 MINECRAFT_WEBHOOK_SECRET = os.getenv("MINECRAFT_WEBHOOK_SECRET", "")
@@ -89,6 +95,7 @@ def init_firebase():
 
 db = init_firebase()
 CONFIG_REF = db.collection("appMeta").document("discordBot")
+roster_store = FirestoreRosterStore(db, firestore.SERVER_TIMESTAMP, firestore.DELETE_FIELD)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -495,13 +502,17 @@ async def run_blocking(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def find_player_sync(name, team=""):
+def find_player_sync(name, team="", include_inactive=False):
     docs = db.collection("players").where("name", "==", name).stream()
-    matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
-    if not team:
-        return matches[0] if matches else None
-    lowered_team = team.lower()
-    return next((player for player in matches if normalize(player.get("team")).lower() == lowered_team), None)
+    matches = [{"id": doc.id, **doc.to_dict()} for doc in docs
+               if include_inactive or is_active_player(doc.to_dict())]
+    if team:
+        lowered_team = team.lower()
+        matches = [player for player in matches if normalize(player.get("team")).lower() == lowered_team]
+    # Historical queries can see archived rows, but a currently registered player
+    # takes precedence over a same-named departed record. Tie-breaks are stable.
+    matches.sort(key=lambda player: (not is_active_player(player), player["id"]))
+    return matches[0] if matches else None
 
 
 async def find_player(name, team=""):
@@ -898,7 +909,7 @@ def parse_nickname_args(args):
 
 
 def commit_player_registration_sync(name, team, author_text):
-    existing = find_player_sync(name, team)
+    existing = find_player_sync(name, team, include_inactive=True)
     if existing:
         raise ValueError(f"이미 등록된 선수입니다: {name} ({team})")
 
@@ -922,7 +933,7 @@ def commit_nickname_change_sync(old_name, new_name, team, date, author_text):
     if not player:
         raise ValueError(f"선수 목록에 없는 선수입니다: {old_name} ({team})")
 
-    existing = find_player_sync(new_name, team)
+    existing = find_player_sync(new_name, team, include_inactive=True)
     if existing:
         raise ValueError(f"이미 같은 팀에 존재하는 닉네임입니다: {new_name} ({team})")
 
@@ -1059,7 +1070,7 @@ def commit_simple_movement_sync(kind, team, players, date, author_text, reason="
 
     for name in players:
         docs = db.collection("players").where("name", "==", name).stream()
-        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs if is_active_player(doc.to_dict())]
         player = next((p for p in matches if normalize(p.get("team")).lower() == from_team.lower()), None)
 
         if not player:
@@ -1083,7 +1094,7 @@ def commit_simple_movement_sync(kind, team, players, date, author_text, reason="
 
 def find_fa_sign_player_sync(name):
     docs = db.collection("players").where("name", "==", name).stream()
-    matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+    matches = [{"id": doc.id, **doc.to_dict()} for doc in docs if is_active_player(doc.to_dict())]
 
     if not matches:
         raise ValueError(f"선수 목록에 없는 선수입니다: {name}")
@@ -1128,7 +1139,7 @@ def commit_trade_sync(from_team, from_players, to_team, to_players, date, author
 
     for name in from_players:
         docs = db.collection("players").where("name", "==", name).stream()
-        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs if is_active_player(doc.to_dict())]
         player = next((p for p in matches if normalize(p.get("team")).lower() == from_team.lower()), None)
 
         if not player:
@@ -1138,7 +1149,7 @@ def commit_trade_sync(from_team, from_players, to_team, to_players, date, author
 
     for name in to_players:
         docs = db.collection("players").where("name", "==", name).stream()
-        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+        matches = [{"id": doc.id, **doc.to_dict()} for doc in docs if is_active_player(doc.to_dict())]
         player = next((p for p in matches if normalize(p.get("team")).lower() == to_team.lower()), None)
 
         if not player:
@@ -1197,7 +1208,7 @@ def fetch_recent_movements_sync():
 
 
 def find_player_team_by_name_sync(name):
-    player = find_player_sync(name)
+    player = find_player_sync(name, include_inactive=True)
     return normalize(player.get("team")) if player else ""
 
 
@@ -1245,7 +1256,7 @@ def punishment_roster_text(record):
 def apply_roster_removal_for_punishment(batch, record):
     if not is_roster_removal_punishment(record):
         return False
-    player = find_player_sync(record.get("nickname"))
+    player = find_player_sync(record.get("nickname"), include_inactive=True)
     if not player:
         return False
     if normalize(player.get("team")) == "무소속" and normalize(player.get("transfer")) == punishment_roster_text(record):
@@ -1265,7 +1276,7 @@ def apply_roster_removal_for_punishment(batch, record):
 def revert_roster_removal_for_punishment(batch, record):
     if not is_roster_removal_punishment(record):
         return False
-    player = find_player_sync(record.get("nickname"))
+    player = find_player_sync(record.get("nickname"), include_inactive=True)
     original_team = normalize(record.get("team"))
     if not player or not original_team:
         return False
@@ -1434,7 +1445,7 @@ def punishment_embed(title, records):
 
 def fetch_team_roster_sync(team):
     docs = db.collection("players").where("team", "==", team).stream()
-    players = [{"id": doc.id, **doc.to_dict()} for doc in docs]
+    players = [{"id": doc.id, **doc.to_dict()} for doc in docs if is_active_player(doc.to_dict())]
     return sorted(players, key=lambda player: normalize(player.get("name")).lower())
 
 
@@ -1472,7 +1483,7 @@ def player_aliases_from_movements(player_name, movements):
 
 
 def fetch_player_transfer_info_sync(player_name):
-    player = find_player_sync(player_name)
+    player = find_player_sync(player_name, include_inactive=True)
     if not player:
         raise ValueError(f"현재 로스터에서 해당 닉네임을 찾지 못했습니다: {player_name}")
 
@@ -2889,6 +2900,8 @@ def fetch_player_choices_sync(query_text="", limit=25):
     seen = set()
     for doc_snapshot in docs:
         data = doc_snapshot.to_dict()
+        if not is_active_player(data):
+            continue
         name = normalize(data.get("name"))
         if not name or name.lower() in seen:
             continue
@@ -2958,6 +2971,73 @@ def configured_reaction_roster_team():
         return FREE_AGENT_TEAM
     return team.upper() or FREE_AGENT_TEAM
 
+
+async def configured_roster_service():
+    """Resolve one management guild before any automatic identity/status write."""
+    global ROSTER_SYNC_SERVICE
+    if ROSTER_SYNC_SERVICE:
+        return ROSTER_SYNC_SERVICE
+    async with ROSTER_CONFIGURATION_LOCK:
+        if ROSTER_SYNC_SERVICE:
+            return ROSTER_SYNC_SERVICE
+        config = await get_bot_config()
+        configured_id = normalize(ROSTER_GUILD_ID) or normalize(config.get("rosterGuildId"))
+        if configured_id and not snowflake(configured_id):
+            print("선수 동기화 보류: DISCORD_ROSTER_GUILD_ID 형식이 잘못되었습니다.")
+            return None
+        guild = bot.get_guild(int(configured_id)) if configured_id else None
+        if configured_id and not guild:
+            print("선수 동기화 보류: 설정한 서버에 봇이 없거나 서버를 조회할 수 없습니다.")
+            return None
+
+        channel_id = parse_channel_id(REACTION_ROSTER_CHANNEL_ID)
+        if channel_id:
+            channel = await resolve_channel(channel_id)
+            channel_guild = getattr(channel, "guild", None)
+            if not channel_guild or (guild and channel_guild.id != guild.id):
+                print("선수 동기화 보류: 반응 등록 채널의 서버와 관리 서버 설정을 확인해주세요.")
+                return None
+            guild = channel_guild
+        if not guild and len(bot.guilds) == 1:
+            guild = bot.guilds[0]
+        if not guild:
+            print("선수 동기화 보류: 여러 서버가 연결되어 있습니다. DISCORD_ROSTER_GUILD_ID를 설정해주세요.")
+            return None
+        default_team = configured_reaction_roster_team()
+        registration_enabled = await run_blocking(valid_team_sync, default_team, True)
+        if not registration_enabled:
+            print(f"선수 자동 등록 보류: 기본 팀을 확인해주세요 ({default_team}). 탈퇴 선수 제외는 유지합니다.")
+        role_ids = re.split(r"[,\s]+", normalize(ROSTER_ROLE_IDS))
+        invalid_roles = [value for value in role_ids if value and not snowflake(value)]
+        if invalid_roles:
+            print("선수 자동 등록 역할 ID 형식이 잘못되어 역할 등록을 비활성화합니다. 반응 등록/탈퇴 제외는 유지합니다.")
+            role_ids = []
+        ROSTER_SYNC_SERVICE = RosterSynchronizer(bot, roster_store, guild.id, role_ids, default_team,
+                                               registration_enabled=registration_enabled)
+        print(f"선수 관리 서버 연결: {guild.id}; 역할 자동 등록 {'사용' if ROSTER_SYNC_SERVICE.role_ids else '미사용'}")
+        return ROSTER_SYNC_SERVICE
+
+
+@bot.command(name="선수연결")
+async def link_discord_player_command(ctx, member: discord.Member, *, args: str = ""):
+    """An explicit administrator repair for older players without Discord IDs."""
+    if not await guard(ctx):
+        return
+    parts = shlex.split(args)
+    if len(parts) != 2:
+        await ctx.reply('사용법: `!선수연결 @서버멤버 "선수명" 팀코드` · 기존 선수와 Discord 계정의 연결만 수정합니다.')
+        return
+    service = await configured_roster_service()
+    if not service or not ctx.guild or not service.accepts(ctx.guild.id):
+        raise ValueError("선수 관리 서버에서 실행해주세요. DISCORD_ROSTER_GUILD_ID를 확인해주세요.")
+    if member.bot:
+        raise ValueError("봇 계정은 선수와 연결할 수 없습니다.")
+    current = await ctx.guild.fetch_member(member.id)
+    async with service._lock(str(member.id)):
+        name = await run_blocking(roster_store.link_manual, Identity.from_member(current), parts[0], parts[1], str(ctx.author))
+    await ctx.reply(f"{name} 선수와 {current.mention} 계정의 연결을 저장했습니다. 탈퇴 제외 상태라면 등록 메시지에 다시 반응하거나 등록 역할을 받아주세요.", allowed_mentions=discord.AllowedMentions.none())
+
+
 def player_identity_from_member(member):
     discord_id = str(member.id)
     discord_name = str(member)
@@ -2966,77 +3046,24 @@ def player_identity_from_member(member):
 
 
 def sync_discord_player_identity_sync(member):
-    discord_id, discord_name, display_name = player_identity_from_member(member)
-    existing_by_id = list(db.collection("players").where("discordId", "==", discord_id).limit(1).stream())
-    if not existing_by_id:
-        return None
-
-    snapshot = existing_by_id[0]
-    data = snapshot.to_dict()
-    previous_name = normalize(data.get("name"))
-    updates = {
-        "discordId": discord_id,
-        "discordName": discord_name,
-        "discordDisplayName": display_name,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }
-    if display_name and previous_name != display_name:
-        name_matches = [doc for doc in db.collection("players").where("name", "==", display_name).limit(2).stream() if doc.id != snapshot.id]
-        if name_matches:
-            updates["discordNameConflict"] = display_name
-            snapshot.reference.set(updates, merge=True)
-            return {"changed": False, "conflict": True, "previousName": previous_name, "displayName": display_name}
-        updates["name"] = display_name
-        updates["discordPreviousDisplayName"] = previous_name
-    snapshot.reference.set(updates, merge=True)
-    return {"changed": "name" in updates, "conflict": False, "previousName": previous_name, "displayName": display_name}
+    return roster_store.refresh_identity(Identity.from_member(member))
 
 
-def commit_reaction_player_sync(member, team, author_text):
-    discord_id, discord_name, display_name = player_identity_from_member(member)
-    identity_result = sync_discord_player_identity_sync(member)
-    if identity_result:
-        return "renamed" if identity_result.get("changed") else "updated", display_name
-
-    existing_by_name = find_player_sync(display_name)
-    if existing_by_name:
-        db.collection("players").document(existing_by_name["id"]).set(
-            {
-                "discordId": discord_id,
-                "discordName": discord_name,
-                "discordDisplayName": display_name,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
-        return "linked", display_name
-
-    db.collection("players").add(
-        {
-            "name": display_name,
-            "team": team,
-            "position": "",
-            "number": "",
-            "transfer": f"{today()} Discord 반응 자동 등록: {team}",
-            "discordId": discord_id,
-            "discordName": discord_name,
-            "discordDisplayName": display_name,
-            "createdBy": "discord-reaction-import",
-            "createdByName": author_text,
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        }
-    )
-    return "created", display_name
+def commit_reaction_player_sync(member, team, author_text, allow_restore=True):
+    return roster_store.register(Identity.from_member(member), team, "reaction", author_text, allow_restore)
 
 
 async def fetch_reaction_message(guild, channel, message_id):
     if channel:
+        if not getattr(channel, "guild", None) or channel.guild.id != guild.id:
+            raise ValueError("등록 채널과 선수 관리 서버가 다릅니다.")
         return await channel.fetch_message(int(message_id))
 
     configured_channel_id = parse_channel_id(REACTION_ROSTER_CHANNEL_ID)
     if configured_channel_id:
         configured_channel = guild.get_channel(int(configured_channel_id)) or await bot.fetch_channel(int(configured_channel_id))
+        if not getattr(configured_channel, "guild", None) or configured_channel.guild.id != guild.id:
+            raise ValueError("등록 채널과 선수 관리 서버가 다릅니다.")
         return await configured_channel.fetch_message(int(message_id))
 
     bot_member = guild.me or guild.get_member(bot.user.id)
@@ -3051,31 +3078,40 @@ async def fetch_reaction_message(guild, channel, message_id):
     raise ValueError("반응이 달린 메시지를 찾지 못했습니다. 채널을 같이 지정해주세요.")
 
 
-async def import_reaction_players(guild, channel, message_id, team, author_text):
+async def import_reaction_players(guild, channel, message_id, team, author_text, allow_restore=True):
+    service = await configured_roster_service()
+    if not service or not service.accepts(guild.id):
+        raise ValueError("선수 관리 서버를 확인할 수 없습니다. DISCORD_ROSTER_GUILD_ID를 확인해주세요.")
     message = await fetch_reaction_message(guild, channel, message_id)
     members = {}
     for reaction in message.reactions:
         async for user in reaction.users(limit=None):
             if user.bot:
                 continue
-            member = guild.get_member(user.id)
-            if not member:
-                try:
-                    member = await guild.fetch_member(user.id)
-                except discord.NotFound:
-                    member = None
+            try:
+                member = await guild.fetch_member(user.id)
+            except discord.NotFound:
+                member = None
             if member:
                 members[member.id] = member
 
     created = []
     linked = []
     updated = []
+    conflicts = []
+    waiting = []
     for member in members.values():
-        status, name = await run_blocking(commit_reaction_player_sync, member, team, author_text)
+        status, name = await service.register_member(member, "reaction", author_text, allow_restore, team)
         if status == "created":
             created.append(name)
         elif status == "linked":
             linked.append(name)
+        elif status in {"conflict", "name_conflict"}:
+            conflicts.append(name)
+        elif status == "awaiting_registration":
+            waiting.append(name)
+        elif status in {"ignored", "absent", "stale"}:
+            continue
         else:
             updated.append(name)
 
@@ -3085,6 +3121,8 @@ async def import_reaction_players(guild, channel, message_id, team, author_text)
         "created": created,
         "linked": linked,
         "updated": updated,
+        "conflicts": conflicts,
+        "waiting": waiting,
     }
 
 async def player_name_autocomplete(interaction, current):
@@ -3179,6 +3217,10 @@ async def slash_import_reaction_players(interaction, channel: discord.TextChanne
         embed.add_field(name="신규 등록", value="\n".join(result["created"][:20]) or "-", inline=False)
         embed.add_field(name="기존 선수 연결", value="\n".join(result["linked"][:20]) or "-", inline=False)
         embed.add_field(name="이미 등록됨", value="\n".join(result["updated"][:20]) or "-", inline=False)
+        if result["conflicts"]:
+            embed.add_field(name="동명이인·계정 연결 확인 필요", value="\n".join(result["conflicts"][:20]), inline=False)
+        if result["waiting"]:
+            embed.add_field(name="재등록 대기", value="\n".join(result["waiting"][:20]), inline=False)
         embed.add_field(name="메시지", value=result["message_url"], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
         await send_log("반응 선수 자동 등록", f"{interaction.user} 님이 반응자 {result['total']}명을 동기화했습니다.", [], 0x0F766E)
@@ -3934,31 +3976,47 @@ async def start_minecraft_webhook():
 
 async def sync_existing_reaction_roster_once():
     global REACTION_ROSTER_SYNCED
-    if REACTION_ROSTER_SYNCED:
+    if REACTION_ROSTER_SYNCED or not normalize(REACTION_ROSTER_MESSAGE_ID):
         return
-    REACTION_ROSTER_SYNCED = True
-
-    message_id = normalize(REACTION_ROSTER_MESSAGE_ID)
-    if not message_id:
+    service = await configured_roster_service()
+    if not service:
         return
-
-    team = configured_reaction_roster_team()
-    if not valid_team_sync(team, allow_free_agent=True):
-        print(f"반응 자동 등록 기본 팀이 올바르지 않습니다: {team}")
+    guild = bot.get_guild(int(service.guild_id))
+    if not guild or guild.unavailable:
         return
+    try:
+        # Old reactions cannot prove that a departed user has registered again.
+        # Only a fresh reaction event, an explicit admin import or a current
+        # optional registration role may reactivate a left_guild record.
+        result = await import_reaction_players(guild, None, REACTION_ROSTER_MESSAGE_ID,
+                                              service.default_team, "Discord reaction startup sync", False)
+        REACTION_ROSTER_SYNCED = True
+        print(f"반응 기존 등록 동기화 완료: {result['total']}명, 연결 확인 {len(result['conflicts'])}명, 재등록 대기 {len(result['waiting'])}명")
+    except Exception as exc:
+        # Retry in the periodic loop; do not mark an unsuccessful bootstrap done.
+        print(f"반응 기존 등록 동기화 보류 ({type(exc).__name__}): {exc}")
 
-    for guild in bot.guilds:
+
+async def roster_membership_sync_loop():
+    while not bot.is_closed():
         try:
-            result = await import_reaction_players(guild, None, message_id, team, "Discord reaction auto sync")
-            print(f"반응 기존 등록 동기화 완료: {guild.name} / {result['total']}명")
-            await send_log(
-                "반응 기존 선수 자동 등록",
-                f"봇 시작 시 기존 반응자 {result['total']}명을 동기화했습니다.",
-                [("서버", guild.name, True), ("메시지", result["message_url"], False)],
-                0x0F766E,
-            )
+            service = await configured_roster_service()
+            if service:
+                guild = bot.get_guild(int(service.guild_id))
+                if guild:
+                    result = await service.reconcile(guild)
+                    if not result.get("skipped"):
+                        print(f"선수 멤버십 점검: 탈퇴 제외 {result['removed']}명, 등록/복귀 {result['registered']}명, 조회 보류 {result['failures']}명, 연결 확인 {result['conflicts']}명")
+                await sync_existing_reaction_roster_once()
         except Exception as exc:
-            print(f"반응 기존 등록 동기화 실패: {guild.name}: {exc}")
+            print(f"선수 멤버십 점검 보류 ({type(exc).__name__}): {exc}")
+        await asyncio.sleep(600)
+
+
+def start_roster_membership_sync():
+    global ROSTER_SYNC_TASK
+    if ROSTER_SYNC_TASK is None or ROSTER_SYNC_TASK.done():
+        ROSTER_SYNC_TASK = bot.loop.create_task(roster_membership_sync_loop())
 
 
 @bot.event
@@ -3967,68 +4025,72 @@ async def on_raw_reaction_add(payload):
         return
     if payload.guild_id is None or payload.user_id == bot.user.id:
         return
-
     configured_channel_id = parse_channel_id(REACTION_ROSTER_CHANNEL_ID)
     if configured_channel_id and str(payload.channel_id) != configured_channel_id:
         return
-
-    guild = bot.get_guild(payload.guild_id)
-    if not guild:
-        return
-
     try:
-        member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
-    except discord.NotFound:
-        return
-
-    if member.bot:
-        return
-
-    team = configured_reaction_roster_team()
-    if not valid_team_sync(team, allow_free_agent=True):
-        print(f"반응 자동 등록 기본 팀이 올바르지 않습니다: {team}")
-        return
-
-    try:
-        status, name = await run_blocking(commit_reaction_player_sync, member, team, "Discord reaction auto add")
-        await send_log(
-            "반응 선수 자동 등록",
-            f"{member} 님이 지정 메시지에 반응하여 선수 DB에 반영되었습니다.",
-            [("처리", status, True), ("선수명", name, True), ("Discord ID", member.id, False)],
-            0x0F766E,
-        )
+        service = await configured_roster_service()
+        if not service or not service.accepts(payload.guild_id):
+            return
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = getattr(payload, "member", None) or await guild.fetch_member(payload.user_id)
+        status, name = await service.register_member(member, "reaction", "Discord reaction auto add")
+        if status in {"ignored", "absent", "stale"}:
+            return
+        if status in {"conflict", "name_conflict"}:
+            print(f"선수 자동 등록 연결 확인 필요: {name} / Discord ID {payload.user_id}. !선수연결로 정확한 기존 선수를 연결해주세요.")
+        else:
+            print(f"반응 선수 자동 등록: {status} / {name}")
     except Exception as exc:
-        print(f"반응 선수 자동 등록 실패: {member}: {exc}")
+        print(f"반응 선수 자동 등록 실패 ({type(exc).__name__}): {exc}")
+
+
+@bot.event
+async def on_raw_member_remove(payload):
+    # The raw event covers uncached users too; no nickname guessing or hard delete.
+    if getattr(payload.user, "bot", False):
+        return
+    try:
+        service = await configured_roster_service()
+        if service:
+            removed = await service.member_removed(payload.guild_id, payload.user.id)
+            if removed:
+                print(f"Discord 서버 탈퇴: 활성 선수 목록에서 {removed}건 제외 (기록 보존)")
+    except Exception as exc:
+        print(f"탈퇴 선수 제외 보류, 정기 점검에서 재시도 ({type(exc).__name__}): {exc}")
+
+
+@bot.event
+async def on_member_join(member):
+    try:
+        service = await configured_roster_service()
+        if service:
+            await service.member_changed(member)
+    except Exception as exc:
+        print(f"Discord 재입장 연결 점검 보류 ({type(exc).__name__}): {exc}")
 
 
 @bot.event
 async def on_member_update(before, after):
     if after.bot:
         return
-
-    before_display = normalize(getattr(before, "display_name", ""))
-    after_display = normalize(getattr(after, "display_name", ""))
-    if before_display == after_display and str(before) == str(after):
+    if (getattr(before, "display_name", "") == getattr(after, "display_name", "")
+            and str(before) == str(after)
+            and {role.id for role in before.roles} == {role.id for role in after.roles}):
         return
-
     try:
-        result = await run_blocking(sync_discord_player_identity_sync, after)
-        if result and result.get("changed"):
-            await send_log(
-                "Discord 별명 자동 반영",
-                f"{after} 님의 Discord 별명 변경을 선수명에 반영했습니다.",
-                [("이전", result.get("previousName") or "-", True), ("현재", result.get("displayName") or "-", True), ("Discord ID", after.id, False)],
-                0x0F766E,
-            )
-        elif result and result.get("conflict"):
-            await send_log(
-                "Discord 별명 자동 반영 보류",
-                "변경된 Discord 별명이 이미 다른 선수명으로 등록되어 있어 자동 변경하지 않았습니다.",
-                [("기존", result.get("previousName") or "-", True), ("변경 별명", result.get("displayName") or "-", True), ("Discord ID", after.id, False)],
-                0xF59E0B,
-            )
+        service = await configured_roster_service()
+        if not service:
+            return
+        result = await service.member_changed(after)
+        if isinstance(result, dict) and result.get("conflict"):
+            print(f"Discord 별명 연결 확인 필요: {after.id}")
+        elif isinstance(result, tuple) and result[0] in {"conflict", "name_conflict"}:
+            print(f"Discord 역할 등록 연결 확인 필요: {after.id}")
     except Exception as exc:
-        print(f"Discord 별명 자동 반영 실패: {after}: {exc}")
+        print(f"Discord 선수 별명/역할 동기화 보류 ({type(exc).__name__}): {exc}")
 
 
 @bot.tree.error
@@ -4080,9 +4142,10 @@ async def on_ready():
         SLASH_COMMANDS_SYNCED = True
     start_firestore_watchers()
     start_punishment_sheet_sync()
-    await sync_existing_reaction_roster_once()
+    start_roster_membership_sync()
     await start_minecraft_webhook()
     print(f"KMB Python 봇 준비됨: {bot.user}")
 
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == "__main__":
+    bot.run(os.getenv("DISCORD_TOKEN"))

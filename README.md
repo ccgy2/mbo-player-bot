@@ -1,491 +1,146 @@
-# MBO 선수 관리 웹사이트
+# KMB League Discord 봇 — 선수 멤버십 자동 동기화
 
-Firebase Firestore를 이용해 선수 이름, 팀 정보, 이동 정보, 구단 프런트 정보를 저장하고 조회하는 정적 웹앱입니다.
+이 폴더의 `bot.py`를 실행합니다. 웹사이트와 같은 Firebase Firestore를 사용하며, Discord 서버에서 나간 선수를 현재 선수 목록에서 자동 제외합니다.
 
-## 파일 구성
+## 이번 수정의 동작
 
-- `index.html`: 화면 구조
-- `styles.css`: 반응형 스타일
-- `app.js`: Firebase 연결, 저장, 수정, 삭제, 검색 로직
+| 상황 | 처리 |
+| --- | --- |
+| 지정된 선수 등록 메시지에 반응 | 기존 자동 등록 유지. Discord 사용자 ID와 서버 ID를 선수 문서에 연결 |
+| 등록 역할을 받음 | `DISCORD_ROSTER_ROLE_IDS`를 설정한 경우 자동 등록 |
+| 서버 나가기·추방·차단 | 연결된 선수의 `rosterStatus`를 `left_guild`로 변경 |
+| 웹 선수 목록·로스터·봇 로스터·FA/트레이드 대상 | `left_guild` 상태의 선수 제외 |
+| 기존 팀·포지션·등번호·이적 정보·처벌 기록 | 보존 |
+| 서버 재입장만 함 | 제외 상태 유지 |
+| 재입장 후 등록 메시지에 다시 반응하거나 등록 역할을 받음 | 기존 선수 문서를 복귀 처리. 팀/포지션/등번호는 유지 |
+| 봇이 꺼져 있는 동안 탈퇴 | 시작 후 및 10분마다 서버 소속을 다시 확인해 누락 보정 |
+| 전체 멤버 조회 실패·빈 응답·권한 부족·서버 장애 | 탈퇴로 단정하지 않고 보류 |
 
-## Firebase 연결 방법
+탈퇴 처리는 문서 삭제가 아닙니다. 현재 목록에서 숨기고 기록을 보존하므로, 같은 Discord 계정이 정상 재등록하면 기존 선수 정보에 다시 연결됩니다. 역할을 잃거나 메시지 반응을 지우는 것만으로는 선수 기록을 제외하지 않습니다.
 
-1. Firebase 콘솔에서 프로젝트를 만듭니다.
-2. 웹 앱을 추가한 뒤 Firebase SDK 설정값을 복사합니다.
-3. `app.js` 상단의 `firebaseConfig` 값을 실제 설정값으로 교체합니다.
-4. Authentication에서 이메일/비밀번호 로그인을 활성화합니다.
-5. Firestore Database를 만들고 테스트용으로 시작합니다.
-6. `index.html`을 브라우저에서 열거나 간단한 로컬 서버로 실행합니다.
+첨부된 옛 `bot.zip`은 반응 등록 기능이 없는 이전 Python 봇이었습니다. 이번 봇은 웹 프로젝트에 들어 있던 더 최신 Python 버전을 기준으로 반응 등록, 슬래시 명령어, 팀 관리, 경기 일정/결과, Minecraft 웹훅을 함께 보존했습니다. 옛 `!` 명령어 26개의 이름과 별칭을 유지하고 `!선수연결`을 추가했습니다.
 
-## Firestore 컬렉션
+## 적용 순서
 
-앱은 자동으로 아래 컬렉션을 사용합니다.
-
-- `players`: 선수 정보
-- `clubs`: 구단 프런트 정보
-- `movements`: 트레이드, FA 영입, 방출, 이적 등 선수 이동 내역
-- `leagueGames`: 리그 일정과 경기 결과(웹·Discord 봇 공용)
-- `users`: 계정 프로필과 역할 정보
-- `appMeta/bootstrap`: 첫 BOSS 계정 생성 여부
-
-## 팀 추가·수정 방법
-
-- 권장 방법: 웹에서 BOSS 또는 STAFF 계정으로 로그인 → `메뉴` → `선수·구단` → `로스터` → `구단 프런트 등록`에서 팀 코드와 색상을 저장합니다. 같은 항목의 `수정` 버튼으로 팀명·색상·프런트를 바꿀 수 있습니다.
-- 코드 기본값: `app.js`의 `DEFAULT_TEAM_META`와 Python 봇을 사용할 경우 `bot.py`의 `DEFAULT_TEAM_META`에 팀 코드를 추가합니다. Node 봇을 별도로 사용할 경우 `bot.js`의 `TEAM_META`에도 같은 코드를 추가합니다.
-- PBG는 현재 `app.js`와 운영용 `bot.py`의 기본 팀 목록에 추가되어 있습니다.
-
-## 역할
-
-- `BOSS`: 전체 계정 권한 관리, 로스터, 이동, 구단 프런트 관리
-- `STAFF`: 로스터 수정, 트레이드, FA, 선수 이동 등 전체 운영 관리
-- `OWNER`: 본인 팀 선수의 이동 정보와 관련 이동 내역만 관리
-- `COACH`: 본인 팀 선수의 포지션만 수정
-- `UMPIRE`: PLAYER와 같은 조회 권한에 로스터 유효성 검사 탭 추가
-- `PLAYER`: 기본 역할, 로스터와 선수 이동 정보 조회만 가능
-
-계정 권한 관리:
-
-- `BOSS`만 `계정 권한 관리` 탭을 볼 수 있습니다.
-- 닉네임, 이메일, 역할, 팀으로 계정을 검색할 수 있습니다.
-- 역할과 팀을 수정할 수 있습니다.
-- 삭제 버튼은 Firestore의 `users/{uid}` 프로필 문서를 삭제합니다.
-- 브라우저 앱에서는 Firebase Authentication 계정 자체를 관리자 권한으로 삭제할 수 없습니다. Auth 계정까지 완전히 지우려면 Firebase Console의 Authentication 사용자 목록에서 삭제하거나, Firebase Admin SDK/Cloud Functions에서 `admin.auth().deleteUser(uid)`를 실행해야 합니다.
-
-## 선수 이동 기능
-
-메인 화면 상단에는 최근 이동 내용 5건이 표시됩니다. 팀별 이동 내역에서는 팀명 또는 선수명 검색과 이동 유형 필터를 사용할 수 있습니다.
-
-트레이드는 여러 명을 줄 단위로 입력할 수 있습니다. 예를 들어 이전 팀 선수에 3명, 새 팀/상대 선수에 2명을 입력하면 `3대2` 트레이드로 표시됩니다.
-
-선수 이름은 줄바꿈 또는 쉼표로 구분할 수 있습니다. 트레이드는 하나의 묶음 기록으로 저장되고, 방출/은퇴/FA 영입/이적은 여러 명을 입력하면 선수별 기록으로 각각 저장됩니다.
-
-이동 처리하려는 선수는 먼저 `선수 목록`에 등록되어 있어야 합니다. 이전 팀/새 팀을 입력하면 해당 팀 소속 선수인지도 확인합니다.
-
-선수 일괄 등록:
-
-- 선수 등록 폼의 `.txt 일괄 등록`에 텍스트 파일을 넣으면 닉네임을 한 번에 등록합니다.
-- 파일명으로 팀을 자동 판별합니다. 예: `CPX.txt`는 `CPX` 팀으로 등록합니다.
-- 파일 안의 닉네임은 줄바꿈 또는 쉼표로 구분합니다.
-- 같은 팀에 이미 등록된 닉네임은 중복 등록하지 않습니다.
-
-팀 입력 목록:
-
-- `RMS`
-- `NDG`
-- `CPX`
-- `IH`
-- `KRA`
-- `PLT`
-- `ODV`
-- `SLU`
-- `무소속`
-
-팀 색상:
-
-- `ODV` 오버드라이브: `#FF6A00`
-- `RMS` 레이 마린스: `#c9982c`
-- `NDG` 나이트 드래곤즈: `#000000`
-- `CPX` 청화 피닉스: `#1b65ba`
-- `IH` 아이언 호네츠: `#fec804`
-- `KRA` 크라켄즈: `#c00000`
-- `PLT` 클로베츠 플랜츠: `#0cb218`
-- `SLU` 브레이브 슬러거즈: `#850000`
-
-지원 이동 유형:
-
-- `TRADE`: 트레이드
-- `FA_SIGN`: FA 영입
-- `RELEASE`: 방출
-- `FORCED_RELEASE`: 임의해지, 선수는 `무소속`으로 이동하고 원래 팀 정보가 저장됨
-- `RETIRE`: 은퇴, 새 팀은 `무소속`으로 저장
-- `NICKNAME`: 닉네임 변경, 기존 닉네임과 새 닉네임 개수가 같아야 하며 선수 목록의 이름도 함께 변경
-- `TRANSFER`: 이적
-
-임의해지 규칙:
-
-- 임의해지된 선수는 `forcedReleaseOriginalTeam` 값에 원 소속팀이 저장됩니다.
-- 이후 FA 영입, 이적, 트레이드로 복귀할 때는 원 소속팀으로만 이동할 수 있습니다.
-- 웹과 Discord 봇 모두 같은 제한을 검사합니다.
-
-화면은 `메인`, `선수 이동`, `로스터` 탭으로 나뉩니다. 메인에는 최근 이동과 선수 목록이 보이고, 선수 이동 탭에는 이동 등록과 팀별 이동 내역이 표시됩니다.
-
-팀별 이동 내역 권한:
-
-- `BOSS`, `STAFF`: 전체 팀 이동 내역 조회
-- `OWNER`, `COACH`: 본인 팀 관련 이동 내역만 조회
-- `PLAYER`: 팀별 이동 내역 조회 불가
-
-첫 번째로 회원가입한 계정은 자동으로 `BOSS`가 됩니다. 이후 가입 계정은 기본 `PLAYER`이며, `BOSS`가 화면 상단의 권한 관리 패널에서 역할과 팀을 바꿀 수 있습니다.
-
-## 테스트용 Firestore 규칙
-
-개발 중에만 아래처럼 열어둘 수 있습니다. 회원가입 후 `users`, `appMeta` 문서를 만들기 때문에 쓰기 권한이 필요합니다.
-
-```txt
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if request.auth != null;
-    }
-  }
-}
-```
-
-현재 앱은 HTML/JS만으로 역할별 화면과 저장 로직을 제한합니다. 실제 운영 서버에서는 사용자가 브라우저 코드를 조작할 수 있으므로, Cloud Functions 또는 Firebase Admin SDK로 첫 관리자 생성과 역할 변경을 서버에서 검증하는 방식이 더 안전합니다.
-
-회원가입이 안 될 때 먼저 확인할 것:
-
-- Authentication > Sign-in method에서 이메일/비밀번호가 활성화되어 있는지
-- Firestore Database가 생성되어 있는지
-- Firestore 규칙이 로그인한 사용자의 쓰기를 허용하는지
-- 같은 이메일로 이미 가입한 계정이 있는지
-
-## Discord 봇 연동
-
-`bot.js`는 Discord 명령어와 Firestore를 연결합니다. 봇에서 선수를 등록하거나 이동을 입력하면 웹사이트의 Firestore 데이터가 바뀌고, 웹사이트에서 선수 이동을 저장하면 봇이 지정 채널에 공지를 보냅니다.
-
-### 1. Discord 봇 만들기
-
-1. Discord Developer Portal에서 애플리케이션을 만듭니다.
-2. Bot 메뉴에서 봇을 생성하고 토큰을 복사합니다.
-3. Privileged Gateway Intents에서 `MESSAGE CONTENT INTENT`를 켭니다.
-4. 서버 멤버 역할 확인이 필요하므로 `SERVER MEMBERS INTENT`도 켭니다.
-5. OAuth2 URL Generator에서 `bot` 권한을 선택하고 서버에 초대합니다.
-6. 봇 권한은 최소한 `View Channels`, `Send Messages`, `Embed Links`, `Read Message History`가 필요합니다.
-
-### 2. Firebase Admin SDK 키 만들기
-
-1. Firebase Console > 프로젝트 설정 > 서비스 계정으로 이동합니다.
-2. 새 비공개 키를 생성합니다.
-3. JSON 파일에서 아래 값을 확인합니다.
-   - `project_id`
-   - `client_email`
-   - `private_key`
-
-### 3. `.env` 설정
-
-`env.example`을 복사해서 `.env` 파일을 만듭니다.
+1. 현재 실행 중인 봇을 중지합니다. 같은 토큰/DB로 옛 봇과 새 봇을 동시에 실행하지 마세요.
+2. 이 폴더의 파일로 봇 코드를 교체합니다. 기존 `.env` 또는 Railway Variables의 토큰과 Firebase 설정은 그대로 재사용합니다.
+3. 권장 설정: `DISCORD_ROSTER_GUILD_ID`에 선수 관리 Discord **서버 ID**를 넣습니다.
+4. Discord Developer Portal → 해당 애플리케이션 → Bot → Privileged Gateway Intents에서 **SERVER MEMBERS INTENT**와 **MESSAGE CONTENT INTENT**를 켭니다.
+5. 아래 명령으로 패키지를 설치한 뒤 봇을 시작합니다.
+6. 함께 제공된 웹사이트도 배포합니다. 기존 웹은 새 `rosterStatus` 필터를 아직 적용하지 않아 탈퇴 선수가 계속 보일 수 있습니다.
 
 ```powershell
-Copy-Item env.example .env
-```
-
-`.env`에 값을 채웁니다.
-
-```env
-DISCORD_TOKEN=your_discord_bot_token_here
-DISCORD_CHANNEL_ID=your_channel_id_here
-FIREBASE_PROJECT_ID=mbo-player
-FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@mbo-player.iam.gserviceaccount.com
-FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-```
-
-채널 ID는 Discord 개발자 모드를 켠 뒤 공지 채널을 우클릭해서 복사합니다.
-
-### 4. 패키지 설치 및 실행
-
-```powershell
-npm install
-npm start
-```
-
-정상 실행되면 콘솔에 `MBO 봇 준비됨` 로그가 표시됩니다.
-
-### 5. 지원 명령어
-
-접두사는 `!mbo`입니다.
-
-```txt
-!mbo 도움말
-!mbo 선수목록
-!mbo 선수목록 RMS
-!mbo 선수등록 <이름> <팀> [포지션]
-!mbo 선수삭제 <이름> <팀>
-!mbo 이동 <유형> <이전팀> <선수명> [새팀] [날짜]
-!mbo 이동 트레이드 <이전팀> <선수명> <새팀> <상대선수명> [날짜]
-!mbo 최근이동
-```
-
-예시:
-
-```txt
-!mbo 선수등록 Hyojung_0501 RMS 2B
-!mbo 이동 방출 RMS Hyojung_0501
-!mbo 이동 임의해지 CPX mario_1313
-!mbo 이동 트레이드 RMS Hyojung_0501 NDG mario_1313 2026-05-05
-```
-
-지원 이동 유형:
-
-- `트레이드`
-- `FA영입`
-- `방출`
-- `은퇴`
-- `닉네임변경`
-- `이적`
-- `임의해지`
-
-### 6. 웹사이트와 봇이 연동되는 방식
-
-- 봇 명령어는 Firebase Admin SDK로 Firestore의 `players`, `movements` 컬렉션을 수정합니다.
-- 웹사이트는 Firestore `onSnapshot`으로 실시간 구독 중이므로 봇이 수정한 내용이 자동 반영됩니다.
-- 웹사이트에서 이동 내역을 저장하면 `movements`에 문서가 추가됩니다.
-- 봇은 `movements`의 새 문서를 감지해서 `DISCORD_CHANNEL_ID` 채널에 Embed 공지를 보냅니다.
-- 봇 자신이 만든 이동 내역은 `createdBy: "discord-bot"` 값으로 구분해서 중복 공지를 막습니다.
-
-### 7. 주의사항
-
-- 봇을 켜 둔 PC/서버가 꺼지면 Discord 명령어와 자동 공지가 작동하지 않습니다.
-- `PLAYER` 역할이 있는 Discord 사용자는 `!mbo 선수등록`을 사용할 수 없게 막혀 있습니다.
-- Discord 역할명은 정확히 `PLAYER`여야 합니다.
-- 임의해지 선수는 원 소속팀으로만 복귀할 수 있습니다.
-- 봇은 Firebase Admin SDK를 사용하므로 `.env`와 서비스 계정 키를 외부에 공개하면 안 됩니다.
-
-## 실행
-
-정적 파일이라 `index.html`을 직접 열 수 있습니다. Firebase 모듈 CDN을 안정적으로 불러오려면 로컬 서버를 쓰는 편이 좋습니다.
-
-```powershell
-python -m http.server 5500
-```
-
-그 다음 브라우저에서 `http://localhost:5500`으로 접속합니다.
-
-## Railway로 Discord 봇 24시간 구동
-
-가능합니다. 이 프로젝트의 봇은 `package.json`에 이미 아래 실행 스크립트가 있어서 Railway가 Node.js 앱으로 감지하면 `npm start`로 실행할 수 있습니다.
-
-```json
-{
-  "scripts": {
-    "start": "node bot.js"
-  }
-}
-```
-
-### 먼저 절대 올리면 안 되는 파일
-
-GitHub에 올리면 안 됩니다.
-
-- `.env`
-- Firebase 서비스 계정 JSON 파일
-- `node_modules`
-
-프로젝트에는 `.gitignore`가 있어 위 파일들이 커밋되지 않도록 막습니다. 그래도 GitHub에 올리기 전 `git status`에서 `.env`나 `firebase-adminsdk` JSON이 보이면 절대 커밋하지 마세요.
-
-### GitHub에 올리기
-
-```powershell
-git init
-git add .
-git status
-git commit -m "Initial MBO bot deployment"
-git branch -M main
-git remote add origin https://github.com/내계정/저장소이름.git
-git push -u origin main
-```
-
-`git status`에서 `.env`나 서비스 계정 JSON이 보이면 `git add` 전에 멈추고 `.gitignore`를 확인해야 합니다.
-
-### Railway 프로젝트 만들기
-
-1. Railway에서 새 프로젝트를 만듭니다.
-2. `Deploy from GitHub repo`를 선택합니다.
-3. 방금 올린 GitHub 저장소를 선택합니다.
-4. Railway가 Node.js 프로젝트를 감지하면 자동으로 빌드합니다.
-5. 서비스의 `Variables` 탭으로 이동합니다.
-
-### Railway Variables 설정
-
-Railway에는 `.env` 파일을 올리는 대신 Variables에 직접 넣습니다.
-
-필수 변수:
-
-```env
-DISCORD_TOKEN=...
-DISCORD_CHANNEL_ID=...
-FIREBASE_PROJECT_ID=mbo-player
-FIREBASE_CLIENT_EMAIL=...
-FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-```
-
-Railway Variables의 RAW Editor가 있으면 `.env` 내용을 붙여넣는 방식이 편합니다.
-
-주의:
-
-- `FIREBASE_PRIVATE_KEY`의 `\n` 줄바꿈은 유지해야 합니다.
-- 따옴표까지 포함해도 `bot.js`에서 `replace(/\\n/g, "\n")`로 처리합니다.
-- Firebase 서비스 계정 JSON 파일 자체를 Railway에 업로드하거나 GitHub에 커밋할 필요는 없습니다.
-
-### Discord Developer Portal 설정
-
-봇이 메시지 명령어를 읽고 역할을 확인하려면 아래 Intent가 켜져 있어야 합니다.
-
-- `MESSAGE CONTENT INTENT`
-- `SERVER MEMBERS INTENT`
-
-봇 초대 권한은 최소 아래가 필요합니다.
-
-- View Channels
-- Send Messages
-- Embed Links
-- Read Message History
-
-### 24시간 구동 관련 비용
-
-Railway는 현재 Free/Trial로 실험할 수 있지만, 계속 켜두는 봇은 보통 유료 플랜 사용을 전제로 잡는 편이 안전합니다. Railway 문서 기준 Hobby 플랜은 월 $5이고, 이 금액이 월 리소스 사용량에 포함됩니다. Discord 봇은 트래픽이 크지 않으면 보통 리소스를 많이 쓰지 않지만, 실제 비용은 Railway 사용량에 따라 달라집니다.
-
-### 배포 후 확인
-
-Railway 서비스 로그에서 아래 문구가 보이면 봇이 켜진 상태입니다.
-
-```txt
-MBO 봇 준비됨: 봇이름#0000
-```
-
-Discord 서버에서 테스트합니다.
-
-```txt
-!mbo 도움말
-!mbo 선수목록
-!mbo 최근이동
-```
-
-웹에서 선수 이동을 저장했을 때 `DISCORD_CHANNEL_ID` 채널에 공지가 올라오면 웹 -> 봇 연동도 정상입니다.
-
-### Railway에서 자주 막히는 부분
-
-- Variables를 넣은 뒤 재배포하지 않으면 새 값이 반영되지 않을 수 있습니다.
-- `DISCORD_TOKEN`이 틀리면 봇 로그인이 실패합니다.
-- `FIREBASE_PRIVATE_KEY` 줄바꿈이 깨지면 Firebase Admin 초기화가 실패합니다.
-- Discord Developer Portal에서 Message Content Intent가 꺼져 있으면 `!mbo` 명령어를 읽지 못합니다.
-- 봇이 채널에 글을 못 쓰면 Discord 채널 권한과 `DISCORD_CHANNEL_ID`를 확인해야 합니다.
-
-## Python Discord 봇
-
-JS 봇 대신 Python 봇을 사용할 수 있습니다. Railway에서는 `Procfile`의 `worker: python bot.py` 설정으로 실행합니다.
-
-### 필요 파일
-
-- `bot.py`: Python Discord 봇 본체
-- `requirements.txt`: Railway가 설치할 Python 패키지 목록
-- `Procfile`: Railway worker 실행 명령
-- `.env`: 로컬 실행용 환경변수. GitHub에는 올리지 않습니다.
-
-### Python 봇 패키지
-
-```txt
-discord.py
-firebase-admin
-python-dotenv
-```
-
-로컬에서 실행하려면 아래처럼 설치합니다.
-
-```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python bot.py
 ```
 
-### 권한
+새 설치라면 `.env.example`을 `.env`로 복사하고 빈 설정을 채웁니다.
 
-모든 `!mbo` 명령어는 아래 중 하나를 만족해야 실행됩니다.
-
-- Discord 서버 관리자 권한 보유자
-- 이름이 정확히 `관리자`인 역할 보유자
-- Discord 유저 ID가 `742989026625060914`인 사용자
-
-권한이 없으면 봇이 명령어를 거부합니다.
-
-### Python 봇 명령어
-
-```txt
-!mbo 도움말
-!mbo 트레이드 <이전팀> <선수명> <새팀> <상대선수명> [날짜]
-!mbo 방출 <팀> <선수명> [날짜]
-!mbo 은퇴 <팀> <선수명> [날짜]
-!mbo 임의해지 <팀> <선수명> [날짜]
-!mbo 최근이동
-!mbo 유효성검사 <타순표>
+```powershell
+Copy-Item .env.example .env
 ```
 
-예시:
+기존 실행 환경의 Python 3.11 설정, `Procfile`의 `worker: python bot.py`, Railway 설정 파일은 유지했습니다. 최신 Python 기능에 필요한 `aiohttp`가 requirements에 포함되어 있습니다.
 
-```txt
-!mbo 트레이드 RMS Hyojung_0501 NDG mario_1313 2026-05-05
-!mbo 방출 RMS Hyojung_0501
-!mbo 은퇴 CPX mario_1313
-!mbo 임의해지 CPX mario_1313
-!mbo 최근이동
+### Railway
+
+기존 서비스의 Variables를 재사용하고 필요한 서버 ID/등록 역할 ID만 추가한 뒤 재배포합니다. 시작 명령은 `python bot.py`입니다. 봇 역할은 1개 인스턴스로 실행하세요. Python 코드가 들어 있는 **이 봇 폴더**를 배포하며, 웹의 `public` 폴더를 봇 실행 경로로 쓰지 않습니다.
+
+Minecraft HTTP 웹훅을 사용한다면 `MINECRAFT_WEBHOOK_SECRET`과 공개 HTTP 도메인/포트를 설정하고 서비스가 HTTP 요청을 받을 수 있게 운영합니다. 서버가 제공하는 `PORT`를 우선 사용합니다. Heroku처럼 프로세스 유형을 구분하는 호스팅에서 HTTP 웹훅을 노출할 때에는 `web: python bot.py` 유형이 필요하며, 별도 worker로 같은 봇을 중복 실행하지 않습니다. Minecraft를 쓰지 않으면 해당 설정은 비워 둡니다.
+
+## 환경변수
+
+| 변수 | 용도 |
+| --- | --- |
+| `DISCORD_TOKEN` | 기존 봇 토큰. 필수 |
+| `FIREBASE_PROJECT_ID` | 기존 Firebase 프로젝트 ID. 필수 |
+| `FIREBASE_CLIENT_EMAIL` | 기존 Firebase 서비스 계정 이메일. 필수 |
+| `FIREBASE_PRIVATE_KEY` | 기존 Firebase 서비스 계정 비공개 키. 필수. `\n` 개행 유지 |
+| `DISCORD_ROSTER_GUILD_ID` | 선수 관리 서버 ID. 설정 권장. 봇이 여러 서버에 있으면 명확한 범위 설정 필요 |
+| `DISCORD_REACTION_ROSTER_MESSAGE_ID` | 원래 자동 등록 메시지 ID. 기존 기본값 `1515707426421084321` 유지. 빈 값이면 반응 자동 등록 비활성 |
+| `DISCORD_REACTION_ROSTER_CHANNEL_ID` | 해당 메시지가 있는 채널 ID. 기존 값이 있으면 유지 |
+| `DISCORD_REACTION_ROSTER_TEAM` | 신규 자동 등록 기본 팀. 기본 `무소속`. 기존 등록 선수의 소속은 덮어쓰지 않음 |
+| `DISCORD_ROSTER_ROLE_IDS` | **선택**. 선수를 등록하는 역할 ID를 쉼표로 구분. 비워 두면 역할로 등록하지 않음 |
+| `DISCORD_ROSTER_ROLE_ID` | 위 변수 대신 역할 1개를 지정할 때의 호환 이름 |
+| `DISCORD_CHANNEL_ID` | 기존 일반 공지 채널 |
+| `DISCORD_LOG_CHANNEL_ID` | 기존 운영 로그 채널 |
+| `MINECRAFT_WEBHOOK_SECRET` | 선택. 기존 Minecraft 웹훅 인증값 |
+| `MINECRAFT_WEBHOOK_PORT` / `PORT` | 선택. HTTP 웹훅 수신 포트. `PORT` 우선 |
+
+역할 ID 예시에서 **팀 역할을 모두 넣을 필요는 없습니다**. 등록 채널에서 사용자가 받는 선수 자격 역할만 넣으면 됩니다. 역할 자체를 부여하는 기존 반응 역할 봇/Discord 설정은 그대로 사용합니다. 이 봇의 기존 팀 역할 동기화 설정과 새 선수 등록 역할 설정은 별개입니다.
+
+역할을 새로 설정하지 않아도 원래의 **지정 메시지 반응 → 선수 등록** 흐름과 **서버 탈퇴 → 현재 목록 제외**가 작동합니다.
+
+## 관리 서버와 기존 데이터 연결
+
+자동 동기화 대상 서버는 다음 순서로 결정합니다.
+
+1. `DISCORD_ROSTER_GUILD_ID` 또는 기존 Firestore `appMeta/discordBot.rosterGuildId`.
+2. 설정된 반응 등록 채널이 속한 서버.
+3. 위 설정이 없고 봇이 정확히 서버 1개에만 속해 있으면 그 서버.
+
+서버 ID와 반응 채널의 서버가 다르거나, 여러 서버 중 어느 서버인지 확정할 수 없으면 자동 동기화를 보류하고 실행 로그에 이유를 남깁니다. 다른 서버에 명시적으로 연결된 선수는 변경하지 않습니다.
+
+기존 `discordId`만 있고 서버 ID가 없는 반응 등록 선수는 확정된 관리 서버 범위에서 기존 ID로 연결합니다. 같은 ID가 이미 다른 서버에 연결되어 있어 모호한 데이터는 자동 변경하지 않습니다.
+
+**Discord ID가 없는 수동 선수는 이름만 보고 탈퇴 처리하지 않습니다.** 등록 메시지 반응/역할 등록 과정에서 같은 이름·같은 팀의 기존 선수 1명이 분명하게 일치하면 연결합니다. 다른 팀의 동명이인, 이미 다른 Discord 계정에 연결된 이름, 여러 후보는 보류합니다.
+
+현재 Discord 별명과 기존 선수명이 다르거나 기본 팀이 `무소속`이라 기존 팀 선수와 자동 연결되지 않는다면 관리자가 정확한 선수를 한 번 연결할 수 있습니다.
+
+```text
+!선수연결 @서버멤버 "기존선수명" PBG
 ```
 
-유효성 검사 예시:
+이 명령은 기존 관리자 권한 검사를 적용하고, 다른 계정의 연결을 덮어쓰거나 소속팀을 바꾸지 않습니다. 선수명도 그대로 둡니다. 이미 탈퇴 제외된 선수의 자격을 이 명령만으로 복귀시키지는 않습니다. 연결 이후 다시 등록 메시지에 반응하거나 등록 역할을 받으면 기존 기록에 복귀합니다.
 
-```txt
-!mbo 유효성검사
-1번 0lIl SS
-2번 macshox21 RF 교체권한
-3번 taekyeon_63 CF
+Discord 별명 변경 자동 반영은 기존 기능을 유지합니다. 새 별명이 다른 선수 이름과 충돌하면 선수명을 유지하고 확인 필요 상태를 기록합니다.
+
+## 재시작과 재등록 정책
+
+- 캐시가 없는 탈퇴도 `on_raw_member_remove`로 처리합니다.
+- 시작 후/10분 정기 점검은 멤버 목록을 끝까지 읽은 다음 각 대상의 현재 서버 소속을 다시 확인합니다.
+- 탈퇴 추론에는 Discord의 `Unknown Member` 응답(`404`, 코드 `10007`)만 사용합니다. `Unknown Guild`, 권한 오류, 제한, 네트워크 장애는 보류합니다.
+- 재입장만 했거나 별명만 변경한 경우 `left_guild`를 풀지 않습니다.
+- 시작 시 예전 메시지에 남아 있는 오래된 반응만으로 이미 탈퇴 제외된 선수를 복귀시키지 않습니다. 재입장 후 다시 반응을 달거나 등록 역할을 받아야 합니다. 관리자의 명시적 `/반응선수등록` 실행은 지정 메시지 현재 반응자를 다시 등록하는 작업으로 처리합니다.
+- 등록/탈퇴 이벤트와 정기 점검이 겹치면 늦게 도착한 조회 결과가 최신 이벤트를 덮어쓰지 않도록 검사합니다.
+- 같은 등록 이벤트가 반복되어도 새 문서를 계속 만들지 않습니다. 동일 Discord ID의 기존 중복 문서가 있다면 탈퇴 시 모두 제외하되, 모호한 중복을 자동 합치거나 지우지는 않습니다.
+
+## Firestore 데이터 계약
+
+기존 `players/{id}` 문서에 다음 필드만 보충합니다. 별도 컬렉션 이동이나 일괄 삭제 마이그레이션은 없습니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `discordId` | 문자열 Discord 사용자 ID |
+| `discordGuildId` | 문자열 선수 관리 서버 ID |
+| `rosterStatus` | `active` 또는 `left_guild`. 필드가 없는 옛 수동 선수는 활성 취급 |
+| `discordSyncVersion` | 현재 동기화 형식 `1` |
+| `discordLeftAt` | 탈퇴 확인 시 Firestore 서버 타임스탬프 |
+| `discordLeftReason` | 이벤트/정기 확인 등의 처리 이유 |
+| `discordRejoinedAt` | 재등록으로 복귀한 시각 |
+| `discordRegistrationSource` | `reaction` 또는 `role` |
+
+`left_guild`와 정확히 일치할 때만 현재 목록에서 제외합니다. 보관 상태 필드가 없거나 알 수 없는 상태는 자동 제외하지 않습니다. 신규 활성 등록이나 정상 복귀 시 탈퇴 시각·사유를 해제합니다. `team`, `position`, `number`, `transfer`, `forcedReleaseOriginalTeam`, 이적 및 처벌 컬렉션은 탈퇴/복귀 때문에 삭제하지 않습니다.
+
+관리자 웹 수동 등록으로 탈퇴 선수를 같은 이름·같은 팀의 새 선수로 중복 생성하지 않도록 웹과 봇에서 기존 보관 기록도 검사합니다. 이적/처벌 내역 조회는 보관 기록을 유지하며, 현재 선수 대상 조회는 활성 선수를 사용합니다.
+
+## 오프라인 검증
+
+```powershell
+python -m unittest discover -s tests -v
+python -m py_compile bot.py roster_sync.py
 ```
 
-또는:
+테스트는 가짜 Firestore·Discord 객체와 실제 배포 파일에서 추출한 함수/이벤트 핸들러를 사용합니다. `.env`를 읽거나 Firebase를 초기화하지 않고, 실제 Discord 로그인·메시지 전송·운영 DB 변경을 하지 않습니다. 가짜 저장소의 동기 함수를 인라인으로 실행하므로 호스팅의 실제 HTTP 연결, Firestore 자격 증명/규칙, Gateway 권한 및 스레드 실행은 통합 테스트 범위 밖입니다.
 
-```txt
-!mbo 유효성검사
-1.Axrq__ CF
-2.CUCCl 1B
-3._w0nyu1 LF
-```
+핵심 검증 범위: 캐시 없는 탈퇴, 중복 탈퇴 이벤트, 기존 기록 보존, 서버 범위, 이전 문자열/숫자 Discord ID, 동명이인/다른 팀/다른 계정 충돌, 반복 등록, 재입장과 재등록 구분, 재시작 중 누락, 역할 미설정/설정, 불완전 조회/권한 오류/잘못된 서버, 이벤트와 늦은 조회 경합, 웹과 공통 활성 로스터 조회 규칙.
 
-봇은 타순표에서 닉네임을 분리해서 Firestore `players` 컬렉션에 등록된 선수인지 검사합니다.
+운영 연결은 이 환경에서 실행하지 않았습니다. 배포 후 실제 등록 메시지·역할과 테스트 계정으로 등록 → 서버 탈퇴 → 웹 현재 목록 제외 → 재입장만으로는 미복귀 → 다시 등록 시 기존 정보 복귀를 확인하세요. 실제 호스팅 장애/사용자 연결 상황에 따라 실시간 반영이 늦으면 봇 로그와 10분 점검 결과를 확인합니다.
 
-### Railway에서 Python 봇으로 배포
+## 공식 동작 근거
 
-1. GitHub에는 `.env`, Firebase Admin SDK JSON을 올리지 않습니다.
-2. Railway에서 GitHub 저장소를 연결합니다.
-3. Railway가 Python 프로젝트로 감지하도록 `requirements.txt`와 `Procfile`을 같이 올립니다.
-4. Railway Variables에 아래 값을 넣습니다.
+- discord.py 2.4 `on_raw_member_remove`: https://discordpy.readthedocs.io/en/v2.4.0/api.html#discord.on_raw_member_remove
+- discord.py 멤버 Intent와 멤버 조회: https://discordpy.readthedocs.io/en/v2.4.0/intents.html
+- Discord Gateway / Privileged Intents: https://docs.discord.com/developers/events/gateway
 
-```env
-DISCORD_TOKEN=...
-DISCORD_CHANNEL_ID=...
-FIREBASE_PROJECT_ID=mbo-player
-FIREBASE_CLIENT_EMAIL=...
-FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-```
-
-5. Discord Developer Portal에서 아래 Intent를 켭니다.
-
-- `MESSAGE CONTENT INTENT`
-- `SERVER MEMBERS INTENT`
-
-6. Railway 로그에 아래 문구가 나오면 정상입니다.
-
-```txt
-MBO Python 봇 준비됨: 봇이름#0000
-```
-
-### 공지 채널 / 로그 채널 설정
-
-Python 봇에서 Discord 채널을 직접 설정할 수 있습니다.
-
-```txt
-!mbo 채널 설정 <#채널>
-!mbo 로그채널 설정 <#채널>
-```
-
-- `!mbo 채널 설정 <#채널>`: 웹 또는 Discord에서 발생한 선수 이동, FA 영입, 방출, 은퇴, 임의해지, 닉네임 변경, 로스터 등록 공지를 보내는 채널입니다.
-- `!mbo 로그채널 설정 <#채널>`: 누가, 언제, 웹 또는 Discord 어디에서 작업했는지 기록하는 채널입니다.
-- 설정값은 Firestore `appMeta/discordBot` 문서에 저장됩니다.
-- `.env`의 `DISCORD_CHANNEL_ID`는 기본 공지 채널 fallback으로만 사용됩니다.
-- `.env`에 `DISCORD_LOG_CHANNEL_ID`를 넣으면 로그 채널 기본값으로 사용할 수 있습니다.
-
-예시:
-
-```txt
-!mbo 채널 설정 #선수이동공지
-!mbo 로그채널 설정 #봇로그
-```
-
-웹에서 이동 내역 또는 로스터가 추가되면 봇이 Firestore 변경을 감지해 설정된 채널로 전송합니다. Discord 명령어로 발생한 이동은 명령어 응답과 공지 채널에 올라가고, 로그 채널에는 실행자와 명령어 정보가 기록됩니다.
+토큰과 Firebase 서비스 계정 키는 `.env` 또는 호스팅 비밀 변수에서만 관리하고, 웹 `public`·Git 저장소·배포 ZIP에 넣지 않습니다.

@@ -1,0 +1,124 @@
+KMB 웹사이트 · Discord 선수 동기화 업데이트
+작성일: 2026-10-19
+
+1. 적용할 파일
+------------------------------
+KMB-player.zip : Firebase Hosting에 올리는 웹사이트
+bot.zip        : 현재 봇 서버에 올리는 Python Discord 봇
+
+두 파일을 함께 적용해야 탈퇴 상태가 웹 선수 목록에도 반영됩니다.
+이번 파일은 수정된 소스입니다. 운영 Firebase 또는 Discord에 자동 배포한 상태는 아닙니다.
+
+2. 웹사이트 적용
+------------------------------
+1) KMB-player.zip을 새 폴더에 압축 해제합니다.
+2) firebase.json이 있는 폴더에서 다음 명령을 실행합니다.
+
+   firebase deploy --only hosting
+
+3) 이미 열려 있던 사이트를 한 번 새로고침합니다.
+
+기존 Firebase 웹 연결 설정과 .firebaserc의 프로젝트 연결은 보존했습니다.
+웹사이트는 HTML/CSS/JavaScript 구조를 유지하며 별도 프레임워크 빌드가 필요 없습니다.
+firebase init을 다시 실행할 필요는 없습니다.
+
+새 폴더 사용을 권장합니다. 기존 폴더에 덮어쓰면 예전 public의 서버 파일이 남을 수 있습니다.
+firebase.json에도 Python 봇·서버 설정·관리 스크립트를 웹 배포에서 제외하는 규칙을 넣었습니다.
+웹 화면에 필요한 파일은 public에, 테스트와 적용 안내는 프로젝트 루트에 있습니다.
+Minecraft 연동 자료는 실제 서버 코드가 있는 bot.zip의 minecraft-skript와 MINECRAFT_INTEGRATION.md로 옮겼습니다.
+
+3. 봇 적용
+------------------------------
+1) 기존 봇이 실행되는 서버 또는 Railway 프로젝트에 bot.zip의 파일을 적용합니다.
+2) bot.py뿐 아니라 새 roster_sync.py와 갱신된 requirements.txt도 함께 적용합니다.
+3) 기존 Discord 토큰과 Firebase 서비스 계정 환경변수는 그대로 유지합니다.
+4) 필요하면 서버에서 의존성을 설치합니다.
+
+   python -m pip install -r requirements.txt
+
+5) 기존 프로세스를 새 코드로 재시작합니다. 실행 명령은 그대로입니다.
+
+   python bot.py
+
+구버전과 신버전 봇을 같은 토큰으로 동시에 실행하지 말고 기존 실행본을 교체합니다.
+기존 worker Procfile과 Railway 관련 파일은 유지했습니다.
+봇 토큰과 Firebase 개인 키는 결과 ZIP에 포함하지 않았습니다.
+새 환경변수 예시는 bot.zip의 .env.example에 있습니다.
+
+4. Discord 필수 설정
+------------------------------
+Discord Developer Portal > 해당 애플리케이션 > Bot > Privileged Gateway Intents
+
+   SERVER MEMBERS INTENT: 켜기
+
+서버 탈퇴 및 역할 변경을 받기 위해 필요합니다. 코드 쪽 members intent는 켜 두었습니다.
+기존 !명령어를 사용하므로 MESSAGE CONTENT INTENT도 유지하세요.
+
+권장 환경변수:
+   DISCORD_ROSTER_GUILD_ID=선수목록과_연결할_디스코드_서버_ID
+
+서버 한 곳에만 봇이 있으면 자동 인식할 수 있습니다.
+여러 서버에 봇이 있다면 위 값을 반드시 지정해 다른 서버의 탈퇴를 혼동하지 않게 합니다.
+기존 반응 등록 채널을 지정해 두었다면 해당 채널의 서버와 설정이 일치해야 합니다.
+
+역할을 받는 것만으로 등록하려는 경우에만 추가:
+   DISCORD_ROSTER_ROLE_IDS=선수등록_역할_ID
+
+여러 역할은 쉼표로 구분할 수 있습니다.
+이 값을 비워 두면 첨부 최신 코드에 있던 메시지 이모지 반응 등록 방식을 유지합니다.
+기존 DISCORD_REACTION_ROSTER_MESSAGE_ID, DISCORD_REACTION_ROSTER_CHANNEL_ID,
+DISCORD_REACTION_ROSTER_TEAM 설정도 계속 사용할 수 있습니다.
+등록 역할을 제거하는 동작 자체는 서버 탈퇴가 아니므로 명단에서 제거하지 않습니다.
+
+5. 변경 후 동작
+------------------------------
+- 등록된 Discord 계정이 관리 서버를 나가면 현재 선수 목록에서 제외됩니다.
+- 팀 로스터, 팀별 선수 수, 대시보드 선수 수, 로스터 TXT/XLSX에도 같은 기준을 적용합니다.
+- 선수 문서 자체와 팀·포지션·등번호·이적·처벌 기록은 보관합니다.
+- 이적 정보와 처벌 기록 조회는 기존 권한 범위에서 계속 사용할 수 있습니다.
+- 재입장만으로 자동 복귀시키지 않습니다. 등록 메시지에 새로 반응하거나 설정된 등록 역할을 받아야 복귀합니다.
+- 복귀할 때 같은 Discord 계정의 기존 선수 문서를 사용하므로 등번호 등 기록이 유지됩니다.
+- 동일한 명단 파일을 다시 올려도 같은 팀의 탈퇴 선수는 새 선수로 중복 생성하지 않습니다.
+- 봇 재시작 직후와 실행 중 약 10분마다 누락된 탈퇴를 다시 점검합니다.
+- 서버 조회 실패·권한 오류·불완전한 멤버 조회만으로 선수를 탈퇴 처리하지 않습니다.
+
+6. 예전에 수동 등록한 선수
+------------------------------
+Discord 계정 ID가 없는 수동 선수는 이름만 보고 자동 탈퇴 처리하지 않습니다.
+기존 반응 등록으로 계정이 연결된 선수는 바로 대상이 됩니다.
+동명이인이나 예전 이름 때문에 자동 연결을 보류하면 봇 로그에 연결 확인 안내가 남습니다.
+
+관리자는 서버에 있는 정확한 멤버를 다음 명령으로 기존 선수와 연결할 수 있습니다.
+
+   !선수연결 @서버멤버 "선수명" 팀코드
+
+이 명령은 기존 Discord 연결을 다른 사람에게 덮어쓰지 않습니다.
+연결 명령 자체가 탈퇴 보관 선수를 활성 명단으로 복귀시키지는 않습니다.
+선수 계정 연결은 한 번만 해 두면 이후 탈퇴를 자동으로 처리합니다.
+
+7. 개발 검증
+------------------------------
+웹의 네트워크 없는 동작 검증:
+   node tests/roster-state.test.mjs
+
+봇 동기화 검증:
+   python -m unittest discover -s tests -v
+
+검증한 세부 범위와 남은 실제 환경 확인은 함께 제공한 VALIDATION_KO.txt를 참고하세요.
+
+8. 데이터 호환성
+------------------------------
+Firestore players 문서에 추가되는 상태:
+   rosterStatus: active 또는 left_guild
+   discordId / discordGuildId: 문자열 Discord 계정·서버 ID
+   discordLeftAt / discordLeftReason: 탈퇴 처리 시각·사유
+   discordSyncVersion: 1
+
+rosterStatus가 없는 기존 선수는 기존처럼 표시됩니다.
+과거 기록 삭제, 기존 문서 ID 일괄 변경, DB 초기화 작업은 수행하지 않습니다.
+현재 선수에 관한 명단 판단은 새 웹과 봇 양쪽에서 동일하게 적용합니다.
+
+공식 설정 참고:
+https://discordpy.readthedocs.io/en/stable/intents.html
+https://discordpy.readthedocs.io/en/v2.4.0/api.html#discord.on_raw_member_remove
+https://firebase.google.com/docs/hosting/full-config

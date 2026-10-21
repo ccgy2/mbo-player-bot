@@ -1,0 +1,46 @@
+KMB 웹 · 봇 수정 내역
+
+웹
+------------------------------
+public/index.html
+  KMB 로그인/회원가입 화면, 리그 대시보드, 메뉴, 접근성 이름과 화면 구조 개선.
+public/styles.css
+  차콜·아이보리 계열 디자인, 구단/선수 카드, PC 사이드 메뉴, 모바일 접이식 메뉴,
+  라이트/다크 테마, 작은 화면 입력/줄바꿈/포커스/모션 감소 스타일.
+public/app.js
+  실제 선수·구단·경기 데이터의 요약과 다음 경기 표시.
+  활성 선수와 보관 기록 구분, 탈퇴 상태 반영, TXT 중복 등록 방지,
+  가입 팀 조회·처벌 처리·이적 조회·계정 닉네임 변경의 기록 연결 보존.
+public/roster-state.js (신규)
+  웹의 선수 활성 상태, 기존 선수 조회, 일괄등록 분류, 소속 표시 공통 규칙.
+public/404.html
+  KMB 디자인의 한국어 오류 페이지와 홈 이동.
+firebase.json
+  서버 파일 배포 제외 규칙 및 웹 소스 캐시 재검증 설정.
+package.json / tests/
+  외부 패키지 설치 없이 실행할 수 있는 Node/Python 회귀와 정적 검사.
+APPLY_KO.txt / VALIDATION_KO.txt / CHANGELOG_KO.txt
+  적용 순서, 환경변수/Discord 설정, 호환성, 검증 범위 안내.
+
+봇
+------------------------------
+bot.py
+  웹 첨부에 있던 최신 Python 기능을 별도 실행용 봇으로 통합.
+  서버 탈퇴/가입/역할 변경/반응 이벤트, 관리 서버 범위, 정기 점검 연결.
+  현재 선수 로스터/이동 대상 필터 및 역사적 처벌/이적 조회 보존.
+  기존 명령 유지, 정확한 예전 선수 연결용 !선수연결 추가.
+roster_sync.py (신규)
+  Discord 계정/서버 연결, 기록 보존형 탈퇴 처리, 복귀, 중복·늦은 응답 보호.
+requirements.txt
+  통합된 기존 Minecraft 웹훅의 aiohttp 의존성 추가.
+README.md / .env.example / tests/ / TEST_RESULTS.txt
+  현재 Python 실행 구조에 맞춘 설정 예제와 동작 회귀 검증.
+MINECRAFT_INTEGRATION.md / minecraft-skript/
+  기존 웹 공개 폴더의 서버 연동 자료를 봇 패키지로 이동. 내용은 유지.
+
+배포 패키지 정리
+------------------------------
+웹 공개 폴더에 섞여 있던 봇 실행파일, 의존성, 관리 스크립트는 웹 배포에서 제거.
+실행용 Python 봇과 Minecraft 자료는 별도 bot.zip에서 제공.
+실제 토큰/개인 키, .env, 캐시, node_modules는 결과 ZIP에 포함하지 않음.
+기존 Firebase 연결과 데이터 ID는 유지하며 DB 초기화·운영 배포는 수행하지 않음.
